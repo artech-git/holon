@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>txp — Transactional Processes</title>
+<meta name="description" content="txp: all-or-nothing execution of filesystem changes and sandboxed OS processes, coordinated by a crash-safe presumed-abort two-phase commit daemon written in Rust.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ---------- design tokens ---------- */
+:root{
+  --bg:#0c1016; --bg-soft:#11161f; --panel:#141b26; --panel-2:#192231;
+  --line:#243041; --line-soft:#1b2534;
+  --ink:#e6edf6; --ink-dim:#aab6c6; --ink-mute:#7d8aaa;
+  --accent:#34d9a8; --accent-2:#5eead4; --accent-ink:#052a20;
+  --blue:#6aa6ff; --amber:#f5b955; --red:#f2707f; --violet:#b69cff;
+  --radius:14px; --radius-sm:9px;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  --shadow:0 18px 50px -24px rgba(0,0,0,.75);
+  --maxw:1180px;
+}
+:root[data-theme="light"]{
+  --bg:#f6f8fb; --bg-soft:#eef2f7; --panel:#ffffff; --panel-2:#f3f6fa;
+  --line:#dde4ee; --line-soft:#e7ecf3;
+  --ink:#172230; --ink-dim:#415066; --ink-mute:#6a7a90;
+  --accent:#0f9d74; --accent-2:#0b8f6a; --accent-ink:#ffffff;
+  --blue:#2f6bdb; --amber:#b5790f; --red:#cf3049; --violet:#6d52d8;
+  --shadow:0 18px 40px -26px rgba(20,40,70,.35);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:84px}
+body{
+  margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+body.no-scroll{overflow:hidden}
+a{color:var(--accent-2);text-decoration:none}
+a:hover{text-decoration:underline}
+h1,h2,h3,h4{line-height:1.2;letter-spacing:-.02em;font-weight:700;margin:0}
+code,kbd{font-family:var(--mono)}
+::selection{background:color-mix(in srgb,var(--accent) 35%,transparent)}
+
+/* ---------- layout ---------- */
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+.layout{display:grid;grid-template-columns:248px minmax(0,1fr);gap:48px;max-width:var(--maxw);margin:0 auto;padding:0 24px}
+main{min-width:0;padding:40px 0 96px}
+
+/* ---------- top bar ---------- */
+header.top{
+  position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--bg) 82%,transparent);
+  backdrop-filter:saturate(1.3) blur(12px);border-bottom:1px solid var(--line-soft);
+}
+.top .wrap{display:flex;align-items:center;gap:18px;height:62px}
+.brand{display:flex;align-items:center;gap:11px;font-weight:800;letter-spacing:-.03em;font-size:19px;color:var(--ink)}
+.brand:hover{text-decoration:none}
+.logomark{
+  width:34px;height:34px;border-radius:9px;display:grid;place-items:center;flex:none;
+  background:linear-gradient(145deg,var(--accent),var(--accent-2));color:var(--accent-ink);
+  font-family:var(--mono);font-weight:700;font-size:15px;box-shadow:var(--shadow);
+}
+.brand small{font-family:var(--mono);font-weight:500;font-size:11px;color:var(--ink-mute);letter-spacing:0}
+.top nav{margin-left:auto;display:flex;align-items:center;gap:22px}
+.top nav a{color:var(--ink-dim);font-size:14px;font-weight:500}
+.top nav a:hover{color:var(--ink);text-decoration:none}
+.iconbtn{
+  display:grid;place-items:center;width:38px;height:38px;border-radius:9px;cursor:pointer;
+  background:var(--panel);border:1px solid var(--line);color:var(--ink-dim)
+}
+.iconbtn:hover{color:var(--ink);border-color:var(--accent)}
+.ghbtn{
+  display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:9px;font-size:14px;font-weight:600;
+  background:var(--ink);color:var(--bg);border:1px solid var(--ink)
+}
+:root[data-theme="light"] .ghbtn{background:var(--ink);color:#fff}
+.ghbtn:hover{text-decoration:none;opacity:.9}
+.menu-toggle{display:none}
+
+/* ---------- sidebar ---------- */
+aside.side{position:sticky;top:62px;align-self:start;height:calc(100vh - 62px);overflow-y:auto;padding:36px 4px 60px}
+aside.side::-webkit-scrollbar{width:8px}
+aside.side::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+.side h5{font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--ink-mute);margin:22px 0 9px;font-weight:700}
+.side h5:first-child{margin-top:0}
+.side a{display:block;color:var(--ink-dim);font-size:13.5px;padding:5px 12px;border-radius:7px;border-left:2px solid transparent;margin:1px 0}
+.side a:hover{color:var(--ink);background:var(--panel);text-decoration:none}
+.side a.active{color:var(--accent-2);border-left-color:var(--accent);background:var(--panel);font-weight:600}
+
+/* ---------- hero ---------- */
+.hero{padding:64px 0 46px;border-bottom:1px solid var(--line-soft);position:relative;overflow:hidden}
+.hero::before{content:"";position:absolute;inset:0;background:
+  radial-gradient(680px 320px at 82% -8%,color-mix(in srgb,var(--accent) 16%,transparent),transparent 70%);
+  pointer-events:none}
+.hero .wrap{position:relative}
+.eyebrow{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px;color:var(--accent-2);
+  background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);
+  padding:5px 12px;border-radius:999px;margin-bottom:22px}
+.eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 22%,transparent)}
+.hero h1{font-size:clamp(34px,5.4vw,58px);font-weight:800;letter-spacing:-.035em;max-width:16ch}
+.hero h1 .g{background:linear-gradient(120deg,var(--accent),var(--accent-2) 55%,var(--blue));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p.lead{font-size:clamp(16px,2.1vw,20px);color:var(--ink-dim);max-width:62ch;margin:22px 0 0}
+.hero .cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px}
+.btn{display:inline-flex;align-items:center;gap:9px;padding:12px 20px;border-radius:11px;font-weight:600;font-size:15px;border:1px solid transparent;cursor:pointer}
+.btn.primary{background:linear-gradient(145deg,var(--accent),var(--accent-2));color:var(--accent-ink)}
+.btn.primary:hover{text-decoration:none;filter:brightness(1.05)}
+.btn.ghost{background:var(--panel);border-color:var(--line);color:var(--ink)}
+.btn.ghost:hover{text-decoration:none;border-color:var(--accent)}
+.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:30px}
+.badge{font-family:var(--mono);font-size:12px;color:var(--ink-dim);background:var(--panel);border:1px solid var(--line);padding:5px 11px;border-radius:999px}
+.badge b{color:var(--ink);font-weight:600}
+
+/* flow diagram */
+.flow{margin-top:40px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.flow .bar{display:flex;align-items:center;gap:7px;padding:11px 15px;border-bottom:1px solid var(--line-soft);background:var(--panel-2)}
+.flow .bar i{width:11px;height:11px;border-radius:50%;background:var(--line);display:inline-block}
+.flow .bar i:nth-child(1){background:#ff5f57}.flow .bar i:nth-child(2){background:#febc2e}.flow .bar i:nth-child(3){background:#28c840}
+.flow .bar span{margin-left:8px;font-family:var(--mono);font-size:12px;color:var(--ink-mute)}
+.flow pre{margin:0;padding:20px 18px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.75;color:var(--ink-dim)}
+.flow pre b{color:var(--accent-2);font-weight:600}
+.flow pre .mut{color:var(--ink-mute)}
+
+/* ---------- sections ---------- */
+section{padding:56px 0 8px;scroll-margin-top:80px}
+section>h2{font-size:clamp(25px,3.4vw,33px);display:flex;align-items:center;gap:13px}
+section>h2 .num{font-family:var(--mono);font-size:14px;color:var(--accent);font-weight:600;background:color-mix(in srgb,var(--accent) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent) 26%,transparent);width:30px;height:30px;border-radius:8px;display:grid;place-items:center;flex:none}
+section>p.sub{color:var(--ink-dim);font-size:17px;max-width:72ch;margin:14px 0 0}
+h3.sec{font-size:19px;margin:38px 0 12px;letter-spacing:-.02em}
+h4.sec{font-size:15px;margin:26px 0 8px;color:var(--ink);font-family:var(--mono);font-weight:600}
+p{color:var(--ink-dim)}
+main p a{font-weight:500}
+.lede{color:var(--ink);font-size:17px}
+hr.div{border:0;border-top:1px solid var(--line-soft);margin:52px 0}
+
+/* cards */
+.grid{display:grid;gap:16px;margin-top:22px}
+.grid.c2{grid-template-columns:repeat(2,1fr)}
+.grid.c3{grid-template-columns:repeat(3,1fr)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px 20px 18px;position:relative}
+.card:hover{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+.card .ic{width:36px;height:36px;border-radius:9px;background:var(--panel-2);border:1px solid var(--line);display:grid;place-items:center;margin-bottom:13px;color:var(--accent-2)}
+.card h4{font-size:16px;margin-bottom:6px}
+.card p{font-size:14px;margin:0;color:var(--ink-dim)}
+.card .k{font-family:var(--mono);font-size:12px;color:var(--accent-2);font-weight:600}
+
+/* tables */
+.tbl-wrap{overflow-x:auto;margin:22px 0;border:1px solid var(--line);border-radius:var(--radius)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:540px}
+th,td{text-align:left;padding:12px 16px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+thead th{background:var(--panel-2);color:var(--ink);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.05em}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--panel)}
+td code,th code{background:var(--panel-2);padding:1px 6px;border-radius:5px;font-size:12.5px;color:var(--accent-2)}
+:root[data-theme="light"] td code{background:var(--bg-soft)}
+.yes{color:var(--accent)}.no{color:var(--red)}
+
+/* code blocks */
+.code{position:relative;margin:20px 0;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--bg-soft)}
+.code .chead{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--line-soft);background:var(--panel-2)}
+.code .chead .lang{font-family:var(--mono);font-size:11.5px;color:var(--ink-mute);text-transform:uppercase;letter-spacing:.08em}
+.code .chead .fn{font-family:var(--mono);font-size:12px;color:var(--ink-dim)}
+.code .copy{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-mute);background:transparent;border:1px solid var(--line);
+  border-radius:6px;padding:3px 9px;cursor:pointer}
+.code .copy:hover{color:var(--accent-2);border-color:var(--accent)}
+pre{margin:0;overflow-x:auto}
+pre code{display:block;padding:16px 16px;font-family:var(--mono);font-size:13px;line-height:1.7;color:var(--ink);background:transparent}
+pre code .cm{color:var(--ink-mute);font-style:italic}
+
+/* inline code in prose */
+main p code,main li code,.callout code{background:var(--panel);border:1px solid var(--line-soft);padding:1px 6px;border-radius:6px;font-size:13px;color:var(--accent-2)}
+
+/* callouts */
+.callout{display:flex;gap:13px;padding:15px 17px;border-radius:var(--radius-sm);margin:20px 0;border:1px solid var(--line);background:var(--panel);font-size:14.5px}
+.callout .ci{flex:none;width:22px;height:22px;display:grid;place-items:center;margin-top:1px}
+.callout p{margin:0;color:var(--ink-dim)}
+.callout.info{border-left:3px solid var(--blue)} .callout.info .ci{color:var(--blue)}
+.callout.warn{border-left:3px solid var(--amber)} .callout.warn .ci{color:var(--amber)}
+.callout.tip{border-left:3px solid var(--accent)} .callout.tip .ci{color:var(--accent)}
+.callout b{color:var(--ink)}
+
+/* step list */
+ol.steps{counter-reset:s;list-style:none;padding:0;margin:24px 0}
+ol.steps>li{position:relative;padding:0 0 26px 48px;border-left:1px solid var(--line);margin-left:15px}
+ol.steps>li:last-child{border-left-color:transparent;padding-bottom:0}
+ol.steps>li::before{counter-increment:s;content:counter(s);position:absolute;left:-15px;top:-3px;width:30px;height:30px;border-radius:50%;
+  background:var(--panel);border:1px solid var(--accent);color:var(--accent-2);font-family:var(--mono);font-weight:600;font-size:13px;display:grid;place-items:center}
+ol.steps>li h4{margin:2px 0 6px;font-size:16px}
+ol.steps>li p{margin:0;font-size:14.5px}
+
+/* pills */
+.pill{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;vertical-align:middle}
+.pill.done{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.pill.wip{color:var(--amber);background:color-mix(in srgb,var(--amber) 14%,transparent)}
+.pill.todo{color:var(--ink-mute);background:var(--panel-2);border:1px solid var(--line)}
+
+/* feature list with check */
+ul.ck{list-style:none;padding:0;margin:18px 0}
+ul.ck li{position:relative;padding:7px 0 7px 30px;color:var(--ink-dim);border-bottom:1px solid var(--line-soft);font-size:14.5px}
+ul.ck li:last-child{border-bottom:0}
+ul.ck li::before{content:"";position:absolute;left:4px;top:13px;width:9px;height:9px;border-radius:3px;background:var(--accent)}
+ul.ck li b{color:var(--ink)}
+
+/* roadmap tiers */
+.tier{border:1px solid var(--line);border-radius:var(--radius);padding:4px 20px;margin:14px 0;background:var(--panel)}
+.tier summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px;padding:14px 0;font-weight:600;color:var(--ink)}
+.tier summary::-webkit-details-marker{display:none}
+.tier summary .chev{margin-left:auto;transition:transform .2s;color:var(--ink-mute)}
+.tier[open] summary .chev{transform:rotate(90deg)}
+.tier ul{margin:0 0 16px;padding-left:20px}
+.tier li{color:var(--ink-dim);font-size:14px;margin:6px 0}
+.tier .tl{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:6px}
+
+footer{border-top:1px solid var(--line-soft);padding:40px 0 60px;margin-top:40px;color:var(--ink-mute);font-size:13.5px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between}
+footer .brand{font-size:16px}
+
+/* ---------- responsive ---------- */
+@media(max-width:940px){
+  .layout{grid-template-columns:1fr;gap:0}
+  aside.side{position:fixed;top:62px;left:0;bottom:0;width:280px;background:var(--bg);border-right:1px solid var(--line);
+    z-index:45;transform:translateX(-100%);transition:transform .25s;height:auto;padding:24px 18px 60px}
+  aside.side.open{transform:translateX(0);box-shadow:var(--shadow)}
+  .menu-toggle{display:grid}
+  .top nav .hidemob{display:none}
+  main{padding-top:20px}
+  .grid.c2,.grid.c3{grid-template-columns:1fr}
+  .scrim{position:fixed;inset:62px 0 0;background:rgba(0,0,0,.5);z-index:44;opacity:0;pointer-events:none;transition:opacity .25s}
+  .scrim.show{opacity:1;pointer-events:auto}
+}
+@media(min-width:941px){.scrim{display:none}}
+@media(max-width:560px){
+  .wrap,.layout{padding:0 16px}
+  .top nav{gap:12px}
+  .hero{padding:44px 0 36px}
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <button class="iconbtn menu-toggle" id="menuBtn" aria-label="Toggle navigation">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+    <a class="brand" href="#top">
+      <span class="logomark">tx</span>
+      <span>txp <small>transactional processes</small></span>
+    </a>
+    <nav>
+      <a class="hidemob" href="#quickstart">Quickstart</a>
+      <a class="hidemob" href="#manifest">Manifest</a>
+      <a class="hidemob" href="#cli">CLI</a>
+      <a class="hidemob" href="#security">Security</a>
+      <button class="iconbtn" id="themeBtn" aria-label="Toggle theme" title="Toggle theme">
+        <svg id="moon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <a class="ghbtn" href="https://github.com/artech-git/holon" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.57.1.78-.25.78-.55v-1.9c-3.2.7-3.88-1.54-3.88-1.54-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.41-1.27.74-1.56-2.55-.29-5.23-1.28-5.23-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.69 5.41-5.25 5.69.42.37.8 1.1.8 2.22v3.29c0 .3.21.66.79.55A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<div class="scrim" id="scrim"></div>
+
+<span id="top"></span>
+<div class="hero">
+  <div class="wrap">
+    <span class="eyebrow"><span class="dot"></span> Phase&nbsp;1 MVP · Tier&nbsp;0 hardened · Rust 2024</span>
+    <h1>All-or-nothing for the <span class="g">filesystem and the processes</span> that touch it.</h1>
+    <p class="lead">
+      <b style="color:var(--ink)">txp</b> runs filesystem changes and sandboxed OS processes as a single transaction.
+      Every step stages into private state; nothing becomes visible until one fsynced decision record commits the whole set — or
+      a crash at any point leaves the target untouched. Coordinated by a Tokio daemon over a presumed-abort two-phase commit protocol.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#quickstart">Get started
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <a class="btn ghost" href="#protocol">How the protocol works</a>
+    </div>
+    <div class="badges">
+      <span class="badge"><b>Linux-only</b> sandbox</span>
+      <span class="badge">cgroup&nbsp;v2 · overlayfs</span>
+      <span class="badge">Landlock + seccomp</span>
+      <span class="badge">Custom WAL · CRC32C</span>
+      <span class="badge">TLA⁺ model-checked</span>
+      <span class="badge">MIT&nbsp;OR&nbsp;Apache-2.0</span>
+    </div>
+
+    <div class="flow" aria-hidden="true">
+      <div class="bar"><i></i><i></i><i></i><span>the happy path</span></div>
+<pre><b>txp run manifest.toml</b> ──▶ <b>txpd</b> ──▶ lock ▶ Begin ▶ stage steps ▶ prepare ▶ <b>[Commit record · fdatasync]</b> ▶ publish ▶ Done
+                                 │                                  │
+                                 │   <span class="mut">fs participant: same-filesystem staging, rename / RENAME_EXCHANGE redo list</span>
+                                 │   <span class="mut">proc participant: mount+pid+net+ipc+uts namespaces, overlayfs upper per step,</span>
+                                 │   <span class="mut">                  cgroup v2 cgroup.kill, Landlock read-only outside the overlay</span>
+                                 └── <span class="mut">presumed abort: no record ⇒ aborted; abort/done records are lazy</span></pre>
+    </div>
+  </div>
+</div>
+
+<div class="layout">
+  <aside class="side" id="side">
+    <h5>Introduction</h5>
+    <a href="#overview">Overview</a>
+    <a href="#guarantees">What is guaranteed</a>
+    <a href="#architecture">Architecture</a>
+    <h5>Guide</h5>
+    <a href="#requirements">Requirements</a>
+    <a href="#quickstart">Quickstart</a>
+    <a href="#daemon">Running the daemon</a>
+    <h5>Reference</h5>
+    <a href="#manifest">Manifest format</a>
+    <a href="#examples">Worked examples</a>
+    <a href="#cli">CLI commands</a>
+    <h5>Internals</h5>
+    <a href="#protocol">The protocol</a>
+    <a href="#security">Security model</a>
+    <a href="#verification">Verification</a>
+    <h5>Project</h5>
+    <a href="#status">Status &amp; roadmap</a>
+  </aside>
+
+  <main>
+    <!-- OVERVIEW -->
+    <section id="overview">
+      <h2><span class="num">01</span> Overview</h2>
+      <p class="sub">txp gives a build-and-publish job the same guarantee a database gives a write: it either happens completely or not at all — across files <em>and</em> the processes that produce them.</p>
+
+      <p class="lede" style="margin-top:26px">The problem it solves is the half-finished deploy. A script that rebuilds a site, writes files, then dies partway through leaves a directory that is neither the old version nor the new one. txp removes that state entirely.</p>
+
+      <p>A transaction is described by a <strong>manifest</strong> — a TOML file listing the resources it touches and the ordered steps it runs. You submit it with <code>txp run</code>; the daemon <code>txpd</code> acquires locks, runs every step against <em>private, staged</em> copies of the resources, and only makes the result visible if the whole set succeeds. The single commit point is one <code>fdatasync</code>'d record in the daemon's own write-ahead log. Anything that goes wrong before that record — a failing build, a killed step, a power loss — aborts the transaction and leaves the managed tree exactly as it was.</p>
+
+      <div class="grid c3">
+        <div class="card">
+          <div class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg></div>
+          <h4>Atomic by construction</h4>
+          <p>Steps stage into overlay / same-filesystem staging. Publish is a <span class="k">rename</span> or <span class="k">RENAME_EXCHANGE</span> — instantaneous for single swaps, idempotent redo for multi-path sets.</p>
+        </div>
+        <div class="card">
+          <div class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.5 8.5 8 11 4.5-2.5 8-6 8-11V5z"/></svg></div>
+          <h4>Crash-safe</h4>
+          <p>A custom segmented WAL with CRC32C framing and group commit. Every coordinator crash point has been exercised by a deterministic harness; recovery re-drives or presumes abort.</p>
+        </div>
+        <div class="card">
+          <div class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM2 12h20"/></svg></div>
+          <h4>Sandboxed processes</h4>
+          <p>Each process step runs in private mount/pid/net/ipc/uts namespaces with no network interfaces, Landlock read-only outside its overlay, and a seccomp denylist.</p>
+        </div>
+      </div>
+
+      <div class="callout info">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-5M12 8h.01"/></svg></span>
+        <p>This repository implements <b>Phase&nbsp;1 plus the crash-testing subset of Phase&nbsp;2</b> of the design document. It is a working MVP, not yet a multi-node production system — see <a href="#status">Status &amp; roadmap</a> for the exact coverage, deviations, and known limits.</p>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- GUARANTEES -->
+    <section id="guarantees">
+      <h2><span class="num">02</span> What is guaranteed</h2>
+      <p class="sub">Two kinds of participant, two precise contracts. Nothing a transaction does is ever visible before it commits.</p>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Participant</th><th>On abort</th><th>On commit</th><th>Visible before commit</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>fs.tree</code> root<br><span style="color:var(--ink-mute);font-size:13px">files, dir swaps, deletes</span></td>
+              <td class="yes">True rollback — staging is discarded</td>
+              <td>Crash-atomic via idempotent redo; single-file and single-swap publishes are instantaneous</td>
+              <td class="no">Never</td>
+            </tr>
+            <tr>
+              <td>Sandboxed process<br><span style="color:var(--ink-mute);font-size:13px">fs-only effects</span></td>
+              <td class="yes"><code>cgroup.kill</code> + discard upper dir</td>
+              <td>Same as files (overlay upperdir → redo list)</td>
+              <td class="no">Never — private mount ns, no network interfaces, Landlock, seccomp denylist</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Every crash point of the coordinator — <code>kill -9</code> equivalents inserted between every protocol step — has been checked by the <code>txp-crashtest</code> harness, and the protocol itself is model-checked in TLA⁺ under <code>spec/</code>.</p>
+
+      <div class="callout warn">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></span>
+        <p><b>Scope.</b> Only same-filesystem files and processes are transactional. Process effects outside the managed tree (network writes, external databases) are <em>not</em> covered — egress is deny-only today, and there is no external participant, so there is no cross-resource DB+fs atomicity yet.</p>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- ARCHITECTURE -->
+    <section id="architecture">
+      <h2><span class="num">03</span> Architecture</h2>
+      <p class="sub">A Rust workspace of eleven focused crates: pure state machines at the core, I/O and OS mechanism at the edges, a coordinator in the middle, and a thin daemon + CLI on top.</p>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Crate</th><th>Responsibility</th></tr></thead>
+          <tbody>
+            <tr><td><code>txp-core</code></td><td>Pure state machines: ids, <code>LogRecord</code>, <code>TxnTable</code> + recovery rules, typestate driver, the <code>DurableCommit</code> token</td></tr>
+            <tr><td><code>txp-wal</code></td><td>Segmented WAL, CRC32C framing, group-commit writer thread, torn-tail recovery, checkpoints, simulated disk</td></tr>
+            <tr><td><code>txp-lock</code></td><td>Strict 2PL over hierarchical keys, conservative canonical-order acquisition, wait-for graph</td></tr>
+            <tr><td><code>txp-participant</code></td><td>The <code>Participant</code> trait, <code>Capabilities</code>, <code>PartError</code>, local journal, registry</td></tr>
+            <tr><td><code>txp-fs</code></td><td>Filesystem participant: staging, <code>RedoOp</code> publish (rename / <code>RENAME_EXCHANGE</code>, inode-based idempotency)</td></tr>
+            <tr><td><code>txp-proc</code></td><td>Process participant: namespaces, overlayfs, cgroup&nbsp;v2, Landlock, seccomp, upperdir → <code>RedoOp</code> translation</td></tr>
+            <tr><td><code>txp-manifest</code></td><td>TOML manifests, validation, topological step ordering</td></tr>
+            <tr><td><code>txp-engine</code></td><td>The coordinator: per-txn tasks, 2PC presumed abort, 1PC fast path, read-only, recovery, crash points, auth policy</td></tr>
+            <tr><td><code>txp-server</code></td><td><code>txpd</code> — the daemon (newline-JSON over a Unix socket)</td></tr>
+            <tr><td><code>txp-cli</code></td><td><code>txp</code> — the command-line client</td></tr>
+            <tr><td><code>txp-sim</code></td><td><code>txp-crashtest</code> harness + atomicity checker</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Alongside the crates: <code>spec/</code> holds the TLA⁺ model (<code>TwoPhasePA.tla</code>) and its TLC runner, <code>examples/</code> holds manifests, and <code>scripts/</code> holds the root sandbox tests and the TLC driver.</p>
+
+      <div class="callout tip">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1h6c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z"/></svg></span>
+        <p>The design keeps the <b>commit decision</b> in a crate with no I/O at all (<code>txp-core</code>). The only way a transaction enters phase two is by holding a <code>DurableCommit</code> token, which can only be minted after the forced commit record lands — the type system enforces the invariant that nothing publishes before the log says so.</p>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- REQUIREMENTS -->
+    <section id="requirements">
+      <h2><span class="num">04</span> Requirements</h2>
+      <p class="sub">The sandbox depends on Linux kernel mechanisms, so txp is built and run on a Linux host or VM.</p>
+
+      <div class="grid c2">
+        <div class="card">
+          <h4>Platform</h4>
+          <p>Linux with <b>cgroup&nbsp;v2</b>, <b>overlayfs</b>, <b>Landlock</b>, and <b>seccomp</b>. The daemon needs <code>CAP_SYS_ADMIN</code> (run as root) for process steps — namespaces, overlayfs and cgroups require it. Filesystem-only manifests run unprivileged.</p>
+        </div>
+        <div class="card">
+          <h4>Toolchain</h4>
+          <p>A recent Rust toolchain (workspace edition <b>2024</b>). Build with Cargo. No <code>protoc</code> required — the wire protocol is newline-delimited JSON, not gRPC.</p>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></span>
+        <p>On Ubuntu, <code>kernel.apparmor_restrict_unprivileged_userns=1</code> blocks unprivileged user namespaces, which is why the daemon runs privileged (a privileged v1 is allowed by the design). Filesystem-only manifests still work without root.</p>
+      </div>
+
+      <h3 class="sec">Build</h3>
+      <div class="code">
+        <div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code><span class="cm"># clone and build the whole workspace</span>
+git clone https://github.com/artech-git/holon.git
+cd holon
+cargo build --workspace            <span class="cm"># produces target/debug/txpd and target/debug/txp</span>
+cargo build --release --workspace  <span class="cm"># optimized build (debug=1 symbols retained)</span></code></pre>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- QUICKSTART -->
+    <section id="quickstart">
+      <h2><span class="num">05</span> Quickstart</h2>
+      <p class="sub">From a built workspace to an atomic deploy in five steps.</p>
+
+      <ol class="steps">
+        <li>
+          <h4>Start the daemon</h4>
+          <p>Process steps need <code>CAP_SYS_ADMIN</code>, so <code>txpd</code> runs as root. Point it at a data directory (its WAL and journals) and a socket path.</p>
+          <div class="code"><div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>sudo env TXP_DATA_DIR=/var/lib/txp TXP_SOCKET=/run/txpd.sock \
+     target/debug/txpd --socket-mode 0666 &amp;
+export TXP_SOCKET=/run/txpd.sock</code></pre></div>
+        </li>
+        <li>
+          <h4>Confirm it is healthy</h4>
+          <p><code>self-test</code> drives a tiny transaction end to end.</p>
+          <div class="code"><div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>txp self-test</code></pre></div>
+        </li>
+        <li>
+          <h4>Validate a manifest</h4>
+          <p>Checks syntax, resource references, and the topological order of steps — without running anything.</p>
+          <div class="code"><div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>txp validate examples/rebuild-and-publish.toml</code></pre></div>
+        </li>
+        <li>
+          <h4>Run it</h4>
+          <p><code>txp run</code> exits <code>0</code> if and only if the transaction committed. On any failure the managed tree is untouched.</p>
+          <div class="code"><div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>txp run examples/rebuild-and-publish.toml   <span class="cm"># commits</span>
+txp run examples/failing-build.toml         <span class="cm"># aborts; /srv/site untouched</span></code></pre></div>
+        </li>
+        <li>
+          <h4>Inspect and operate</h4>
+          <p>Query live state, then checkpoint or shut down cleanly.</p>
+          <div class="code"><div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>txp list                 <span class="cm"># all known transactions</span>
+txp status &lt;txid&gt;         <span class="cm"># one transaction's phase + steps</span>
+txp in-doubt             <span class="cm"># committed-but-not-done (needs recovery)</span>
+txp checkpoint           <span class="cm"># snapshot + truncate WAL segments</span>
+txp shutdown             <span class="cm"># graceful stop</span></code></pre></div>
+        </li>
+      </ol>
+    </section>
+
+    <hr class="div">
+
+    <!-- DAEMON -->
+    <section id="daemon">
+      <h2><span class="num">06</span> Running the daemon</h2>
+      <p class="sub"><code>txpd</code> speaks newline-delimited JSON over a Unix socket and authorizes submitters by their peer credentials.</p>
+
+      <h3 class="sec">Configuration</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Setting</th><th>How</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>TXP_DATA_DIR</code></td><td>env</td><td>Where the WAL, checkpoints and participant journals live</td></tr>
+            <tr><td><code>TXP_SOCKET</code></td><td>env</td><td>Unix socket path for both the daemon and the <code>txp</code> client</td></tr>
+            <tr><td><code>--socket-mode</code></td><td>flag</td><td>Permission bits on the socket (defaults to <code>0660</code>)</td></tr>
+            <tr><td><code>--allow-uid &lt;uid&gt;</code></td><td>flag</td><td>Permit an additional uid to submit transactions</td></tr>
+            <tr><td><code>--allow-anyone</code></td><td>flag</td><td>Disable the submission check entirely (restores the old open behaviour)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="sec">Who may submit</h3>
+      <p>Submission is authorized by <code>SO_PEERCRED</code>. Out of the box, <strong>root</strong> and the <strong>daemon owner</strong> (the user who invoked <code>sudo</code>) may submit; add others with <code>--allow-uid</code>. Read-only introspection (<code>list</code>, <code>status</code>, <code>locks</code>, …) stays open; the privileged operations <code>Run</code>, <code>Checkpoint</code> and <code>Shutdown</code> are gated.</p>
+
+      <h3 class="sec">Which identity steps run as</h3>
+      <ul class="ck">
+        <li>A <b>root submitter</b>'s process steps run as <code>SUDO_UID:SUDO_GID</code> (the user who invoked sudo) unless a step sets <code>user = "uid:gid"</code>.</li>
+        <li>A <b>non-root submitter</b> is pinned to its own uid/gid — that is the default, and a <code>user</code> requesting any other identity is rejected.</li>
+        <li>The managed root must be writable by the effective uid, exactly as it would be outside the sandbox.</li>
+      </ul>
+    </section>
+
+    <hr class="div">
+
+    <!-- MANIFEST -->
+    <section id="manifest">
+      <h2><span class="num">07</span> Manifest format</h2>
+      <p class="sub">A transaction is a TOML document with one <code>[txn]</code> header, one or more <code>[[resource]]</code> declarations, and an ordered list of <code>[[step]]</code> entries.</p>
+
+      <div class="code">
+        <div class="chead"><span class="lang">toml</span><span class="fn">manifest.toml</span><button class="copy">copy</button></div>
+<pre><code><span class="cm"># the transaction itself</span>
+[txn]
+name = "rebuild-and-publish"
+timeout = "10m"
+
+<span class="cm"># a managed filesystem tree</span>
+[[resource]]
+id = "site"
+kind = "fs.tree"
+path = "/srv/site"
+mode = "write"
+
+<span class="cm"># run a build inside a sandbox, against a staged overlay of `site`</span>
+[[step]]
+id = "build"
+kind = "process"
+argv = ["make", "site"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]   <span class="cm"># staged overlay appears at the real path</span>
+network = "deny"                   <span class="cm"># the only option today</span>
+timeout = "5m"
+
+<span class="cm"># then write a file atomically with the build output</span>
+[[step]]
+id = "stamp"
+kind = "fs.put"
+resource = "site"
+after = ["build"]
+path = "DEPLOY"
+content = "$txid\n"</code></pre>
+      </div>
+
+      <h3 class="sec">Resources</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>Name referenced by steps' <code>resource</code> / <code>mounts</code></td></tr>
+            <tr><td><code>kind</code></td><td><code>fs.tree</code> — a managed filesystem subtree</td></tr>
+            <tr><td><code>path</code></td><td>The real on-disk path the tree lives at</td></tr>
+            <tr><td><code>mode</code></td><td><code>write</code> for a tree the transaction modifies (read-only otherwise)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="sec">Step kinds</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Kind</th><th>Does</th><th>Key fields</th></tr></thead>
+          <tbody>
+            <tr><td><code>process</code></td><td>Runs a command in a sandbox against staged overlays of its mounted resources</td><td><code>argv</code>, <code>cwd</code>, <code>mounts</code>, <code>network</code>, <code>timeout</code>, <code>user</code>, <code>env</code></td></tr>
+            <tr><td><code>fs.put</code></td><td>Writes a single file into a resource</td><td><code>resource</code>, <code>path</code>, and <code>content</code> <em>or</em> <code>source</code></td></tr>
+            <tr><td><code>fs.delete</code></td><td>Deletes a path within a resource</td><td><code>resource</code>, <code>path</code></td></tr>
+            <tr><td><code>fs.replace_tree</code></td><td>Swaps a whole directory in with <code>RENAME_EXCHANGE</code></td><td><code>resource</code>, <code>source</code> (directory)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="sec">Ordering &amp; stacking</h3>
+      <p>Steps declare dependencies with <code>after = ["id", …]</code>; the manifest is validated into a topological order. A later <code>process</code> step that mounts the same resource sees the earlier steps' staged output — overlays stack as lower layers, so a pipeline of build stages composes naturally.</p>
+
+      <h4 class="sec">Variable substitution</h4>
+      <p><code>$txid</code> is substituted in <code>content</code>, <code>argv</code> and <code>env</code>. Process steps additionally receive <code>TXP_TXID</code> and <code>TXP_STEP</code> in their environment.</p>
+    </section>
+
+    <hr class="div">
+
+    <!-- EXAMPLES -->
+    <section id="examples">
+      <h2><span class="num">08</span> Worked examples</h2>
+      <p class="sub">Two manifests ship in <code>examples/</code> — one that commits, one that proves the abort path.</p>
+
+      <h3 class="sec">Rebuild and publish <span class="pill done">commits</span></h3>
+      <p>Build a site inside a sandbox and publish it atomically together with a deploy stamp in a second resource. Nothing under <code>/srv/site</code> changes unless every step succeeds.</p>
+      <div class="code">
+        <div class="chead"><span class="lang">toml</span><span class="fn">examples/rebuild-and-publish.toml</span><button class="copy">copy</button></div>
+<pre><code>[txn]
+name = "rebuild-and-publish"
+timeout = "10m"
+
+[[resource]]
+id = "site"
+kind = "fs.tree"
+path = "/srv/site"
+mode = "write"
+
+[[resource]]
+id = "log"
+kind = "fs.tree"
+path = "/srv/deploylog"
+mode = "write"
+
+[[step]]
+id = "build"
+kind = "process"
+argv = ["/bin/sh", "-c", "set -e; mkdir -p dist; for f in src/*.md; do n=$(basename $f .md); printf '&lt;h1&gt;%s&lt;/h1&gt;\n' \"$(cat $f)\" &gt; dist/$n.html; done; rm -rf old; echo built-by-$TXP_TXID &gt; dist/BUILD"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]
+network = "deny"
+timeout = "5m"
+
+[[step]]
+id = "verify"
+kind = "process"
+argv = ["/bin/sh", "-c", "test -s dist/index.html &amp;&amp; grep -q built-by dist/BUILD"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]
+after = ["build"]
+
+[[step]]
+id = "stamp"
+kind = "fs.put"
+resource = "log"
+path = "last-deploy.txt"
+content = "txid=$txid\n"
+after = ["verify"]</code></pre>
+      </div>
+      <p>The <code>build</code> step's output is staged; <code>verify</code> reads that staged output through a stacked overlay; only once both pass does the coordinator publish the new <code>/srv/site</code> and the stamp in <code>/srv/deploylog</code> together.</p>
+
+      <h3 class="sec">Failing build <span class="pill wip">aborts</span></h3>
+      <p>The build writes files and then exits non-zero. The whole transaction aborts and <code>/srv/site</code> is left untouched — including the <code>rm -rf src</code> the staged step performed, which never reaches the real tree.</p>
+      <div class="code">
+        <div class="chead"><span class="lang">toml</span><span class="fn">examples/failing-build.toml</span><button class="copy">copy</button></div>
+<pre><code>[txn]
+name = "failing-build"
+timeout = "1m"
+
+[[resource]]
+id = "site"
+kind = "fs.tree"
+path = "/srv/site"
+
+[[step]]
+id = "build"
+kind = "process"
+argv = ["/bin/sh", "-c", "echo junk &gt; dist/junk.html; rm -rf src; exit 7"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]</code></pre>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- CLI -->
+    <section id="cli">
+      <h2><span class="num">09</span> CLI commands</h2>
+      <p class="sub">The <code>txp</code> client talks to a running <code>txpd</code> over <code>$TXP_SOCKET</code>. Introspection commands are open; <code>run</code>, <code>checkpoint</code> and <code>shutdown</code> require an authorized submitter.</p>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code>txp self-test</code></td><td>Drive a built-in transaction end to end to confirm the daemon is healthy</td></tr>
+            <tr><td><code>txp validate &lt;manifest&gt;</code></td><td>Parse and validate a manifest (references, step order) without running it</td></tr>
+            <tr><td><code>txp run &lt;manifest&gt;</code></td><td>Submit and run a transaction; exit <code>0</code> iff it committed <span class="pill todo">gated</span></td></tr>
+            <tr><td><code>txp list</code></td><td>List all known transactions and their phases</td></tr>
+            <tr><td><code>txp status &lt;txid&gt;</code></td><td>Show one transaction's phase and per-step state</td></tr>
+            <tr><td><code>txp in-doubt</code></td><td>List transactions committed but not yet done (awaiting recovery drive)</td></tr>
+            <tr><td><code>txp orphans</code></td><td>List orphaned participant journals on disk</td></tr>
+            <tr><td><code>txp locks</code></td><td>Show the lock table / wait-for graph</td></tr>
+            <tr><td><code>txp wal-stats</code></td><td>WAL statistics, including the group-commit batch-size histogram</td></tr>
+            <tr><td><code>txp checkpoint</code></td><td>Take an atomic snapshot and truncate WAL segments <span class="pill todo">gated</span></td></tr>
+            <tr><td><code>txp shutdown</code></td><td>Stop the daemon gracefully <span class="pill todo">gated</span></td></tr>
+            <tr><td><code>txp wal-dump &lt;dir&gt;</code></td><td>Offline inspection of a WAL directory — no daemon needed</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="sec">Testing &amp; verification binaries</h3>
+      <div class="code">
+        <div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>cargo test --workspace          <span class="cm"># unit, property, WAL crash-sim, engine, crash-point harness</span>
+./scripts/test-proc.sh          <span class="cm"># sandbox tests (builds as you, runs the binary with sudo)</span>
+./scripts/tlc.sh                <span class="cm"># TLA+ model check (needs ~/tla/tla2tools.jar + a JRE)</span>
+
+<span class="cm"># crash every coordinator point with a sandboxed step present</span>
+sudo target/debug/txp-crashtest run --with-process</code></pre>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- PROTOCOL -->
+    <section id="protocol">
+      <h2><span class="num">10</span> The protocol</h2>
+      <p class="sub">A presumed-abort two-phase commit with a one-phase fast path and a read-only vote — the whole of which fits in a paragraph, and is model-checked in TLA⁺.</p>
+
+      <ol class="steps">
+        <li><h4>Lock</h4><p>Locks are taken up front in canonical order, which makes the acquisition deadlock-free (conservative strict 2PL over hierarchical keys).</p></li>
+        <li><h4>Begin</h4><p>A <code>Begin</code> record is written <em>unforced</em> — it is cheap and only matters if we later commit. It carries the submitter (uid/gid/pid) for the audit trail.</p></li>
+        <li><h4>Stage</h4><p>Every step runs against private staging: overlay upperdirs for processes, same-filesystem staging for files. Nothing is visible yet.</p></li>
+        <li><h4>Decide</h4><p>If exactly one participant staged anything, it commits in <b>one phase</b> — its local journal record <em>is</em> the commit point, costing zero coordinator fsyncs. Otherwise all staged participants <code>prepare</code> concurrently (fsync their staging + journal), and the coordinator writes the <b>forced <code>Commit</code> record</b> through the group-commit writer.</p></li>
+        <li><h4>Publish</h4><p>Obtaining a <code>DurableCommit</code> token — the only way into phase two — the coordinator fans out <code>commit</code> with unbounded retries, writes <code>Done</code>, and releases the locks.</p></li>
+      </ol>
+
+      <h3 class="sec">Abort &amp; recovery</h3>
+      <p>Any failure before the decision aborts: the coordinator fans out <code>abort</code>, then writes the lazy <code>Abort</code>/<code>Done</code> records. On restart, recovery replays the log — a <code>Commit</code> without a <code>Done</code> is re-driven to completion; <strong>anything else is presumed aborted</strong>, which is why abort and done records can be lazy. A participant's <code>abort</code> is total and can report that it had already locally committed under 1PC; a recovering coordinator adopts that outcome with an audited <code>ForceResolve</code> record.</p>
+
+      <div class="callout tip">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg></span>
+        <p><b>Why "presumed abort" matters:</b> the common case — a transaction that never reaches a commit decision — writes nothing durable that must be cleaned up. The forced fsync happens once, only for transactions that actually commit, and group commit amortizes even that across concurrent transactions into a single write and a single <code>fdatasync</code>.</p>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- SECURITY -->
+    <section id="security">
+      <h2><span class="num">11</span> Security model</h2>
+      <p class="sub">Tier&nbsp;0 hardening — the hard blockers for running under untrusted local clients — is complete. A sandboxed step is confined by five independent mechanisms, and the daemon authenticates every submitter.</p>
+
+      <h3 class="sec">Submission &amp; identity <span class="pill done">done</span></h3>
+      <ul class="ck">
+        <li><b>Peer authentication.</b> <code>serve()</code> captures <code>SO_PEERCRED</code> via <code>UnixStream::peer_cred</code>; an <code>AuthPolicy</code> gates submission to root, the daemon owner, and any <code>--allow-uid</code>. Read-only introspection stays open; <code>Run</code>, <code>Checkpoint</code> and <code>Shutdown</code> are gated.</li>
+        <li><b>Pinned run-as uid.</b> A non-root submitter's process steps are pinned to its own uid/gid (<code>RunAsPolicy</code>); a <code>user = "0:0"</code> from a non-root / non-owner peer is rejected. Root and in-process submitters keep free choice.</li>
+        <li><b>Audit trail.</b> <code>LogRecord::Begin</code> carries an <code>Option&lt;Submitter&gt;</code> (uid/gid/pid), <code>#[serde(default)]</code> so older logs still replay.</li>
+      </ul>
+
+      <h3 class="sec">Sandbox confinement <span class="pill done">done</span></h3>
+      <div class="grid c2">
+        <div class="card"><h4>Namespaces</h4><p>Private <b>mount</b>, <b>pid</b>, <b>net</b>, <b>ipc</b> and <b>uts</b> namespaces. The net namespace has no interfaces — egress is deny-only.</p></div>
+        <div class="card"><h4>overlayfs</h4><p>An overlay <b>upperdir per step</b>, with earlier steps stacked as lowers. The managed path appears at its real location inside the sandbox; the upperdir is translated into the publish redo list.</p></div>
+        <div class="card"><h4>cgroup v2</h4><p><code>cgroup.kill</code> tears the whole step process tree down on abort or timeout — no escapees.</p></div>
+        <div class="card"><h4>Landlock</h4><p>Fail-closed, read-only outside the overlay — a step cannot reach the rest of the filesystem even with a valid path.</p></div>
+      </div>
+      <p style="margin-top:18px"><b>seccomp-bpf denylist.</b> A hand-built cBPF filter (portable across x86-64 / aarch64) is installed in the grandchild after <code>no_new_privs</code>, fail-closed, refusing a fixed set of administrative and exploit-primitive syscalls with <code>EPERM</code>. It is additive to the namespaces, Landlock and the unprivileged uid; a strict allowlist is deliberately not attempted, since it would break ordinary build tools. A root test asserts the step actually runs under seccomp filter mode&nbsp;2.</p>
+
+      <div class="callout info">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-5M12 8h.01"/></svg></span>
+        <p><b>Deferred out of Tier&nbsp;0:</b> supplementary-group checks for a pinned submitter (only the primary gid is honoured today), a connection-level reject for unauthorized peers (currently only privileged ops are gated), and making the seccomp list configurable.</p>
+      </div>
+    </section>
+
+    <hr class="div">
+
+    <!-- VERIFICATION -->
+    <section id="verification">
+      <h2><span class="num">12</span> Verification</h2>
+      <p class="sub">The atomicity claims rest on three independent checks: a formal model of the protocol, a deterministic crash harness over the coordinator, and a simulated disk under the WAL.</p>
+
+      <div class="grid c3">
+        <div class="card"><span class="k">TLA⁺</span><h4>Protocol model</h4><p><code>TwoPhasePA.tla</code> models presumed-abort 2PC: coordinator crash/recovery from the durable log, participant crash before prepare, message duplication, the read-only vote, and the 1PC fast path with outcome-reporting abort. TLC checks it for <code>RM = {r1,r2,r3}</code> in seconds.</p></div>
+        <div class="card"><span class="k">crash points</span><h4>Deterministic harness</h4><p><code>txp-crashtest</code> injects a <code>kill -9</code> equivalent at every protocol step (via <code>TXP_CRASH_AT</code>) and asserts recovery never yields a partial publish — including with a live sandboxed process step.</p></div>
+        <div class="card"><span class="k">sim disk</span><h4>WAL fault injection</h4><p>A simulated disk drops unsynced sectors, tears writes, and returns <code>EIO</code>; the WAL must truncate torn tails, refuse genuine corruption, and turn an fsync error into an abort.</p></div>
+      </div>
+
+      <h3 class="sec">The negative test</h3>
+      <p>Confidence in the model comes from watching it fail on purpose: comment out the guard <code>tcState = "collecting"</code> in <code>TCCommit</code> — allowing a commit decision after an abort was sent — and TLC produces a <code>Consistent</code> counterexample, the exact I2 (no commit-after-abort) violation the real code's <code>TxnTable::apply</code> rejects.</p>
+
+      <div class="code"><div class="chead"><span class="lang">sh</span><button class="copy">copy</button></div>
+<pre><code>scripts/tlc.sh     <span class="cm"># ≈ a few seconds for RM = {r1, r2, r3}</span></code></pre></div>
+
+      <p style="margin-top:4px;font-size:14px;color:var(--ink-mute)">Trace validation (replaying TLC traces against the Rust state machine) and a refinement proof against <code>TCommit</code> are Phase&nbsp;2 work.</p>
+    </section>
+
+    <hr class="div">
+
+    <!-- STATUS -->
+    <section id="status">
+      <h2><span class="num">13</span> Status &amp; roadmap</h2>
+      <p class="sub">An honest map of what is implemented, where the implementation deviates from the design document and why, and what is deliberately deferred.</p>
+
+      <h3 class="sec">Done — Phase 1 + crash-testing subset of Phase 2</h3>
+      <ul class="ck">
+        <li>Invariants <b>I1–I6</b> encoded in the type system / state machine (<code>txp-core</code>)</li>
+        <li>TLA⁺ model with TLC coverage of all actions, invariants and the I2 action property (<code>spec/</code>)</li>
+        <li>Custom segmented WAL: CRC32C framing, torn-tail truncation vs. corruption refusal, preallocation + <code>fdatasync</code>, fsync-error ⇒ abort (<code>txp-wal</code>)</li>
+        <li>Group commit — one write and one <code>fdatasync</code> per batch, adaptive batching, no timers (<code>txp-wal</code>)</li>
+        <li>Checkpoint (atomic snapshot) + segment truncation; WAL-level simulated disk</li>
+        <li>Typestate driver, persisted phase enum, recovery rules (<code>txp-core</code>, <code>txp-engine</code>)</li>
+        <li>Participant trait: total idempotent commit/abort, local journal, <code>recover()</code> (<code>txp-participant</code>)</li>
+        <li>Tokio cancellation safety — protocol in its own task, log writes on a dedicated thread, post-decision retries unbounded</li>
+        <li>fs participant: same-fs staging, rename / <code>RENAME_EXCHANGE</code>, redo list persisted at prepare, idempotent replay</li>
+        <li>proc participant: full namespace set, overlayfs with stacked lowers, cgroup v2, timeout, Landlock, unprivileged uid, upperdir → publish translation</li>
+        <li>1PC fast path (verified zero coordinator fsyncs), read-only vote, pipelined prepares</li>
+        <li>Strict 2PL at the coordinator, hierarchical keys, conservative acquisition, wait-for graph</li>
+        <li>Manifest format + validation + topological order; daemon + CLI; Tier 0 authorization, uid pinning, seccomp</li>
+      </ul>
+
+      <h3 class="sec">Deviations from the design document</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Area</th><th>What &amp; why</th></tr></thead>
+          <tbody>
+            <tr><td>API transport</td><td>Newline-JSON over a Unix socket, not gRPC/tonic — the VM has no <code>protoc</code>, the surface is tiny and versionable. gRPC arrives with the remote participant protocol in Phase 4.</td></tr>
+            <tr><td>Privilege</td><td>The daemon runs as root for process steps — Ubuntu's AppArmor blocks unprivileged user namespaces. fs-only manifests run unprivileged.</td></tr>
+            <tr><td>Egress</td><td>"deny" only (network namespace without interfaces). The deferred-egress proxy / outbox is Phase 3.</td></tr>
+            <tr><td>seccomp</td><td>A denylist, additive to namespaces + Landlock + unprivileged uid + <code>no_new_privs</code>; a strict allowlist would break ordinary build tools.</td></tr>
+            <tr><td>Crash testing</td><td>Deterministic crash points + a WAL-layer sim disk, not yet whole-engine deterministic simulation or a dm-flakey VM harness.</td></tr>
+            <tr><td>1PC safety add</td><td><code>Participant::abort</code> returns an <code>AbortOutcome</code> so a recovering coordinator adopts a local 1PC commit — found while writing the TLA⁺ model.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="sec">Roadmap — production-readiness tiers</h3>
+      <details class="tier">
+        <summary><span class="tl pill done">Tier 0</span> Security &amp; multi-tenancy — <span style="color:var(--accent)">done</span> <span class="chev">›</span></summary>
+        <ul>
+          <li>Peer authentication (<code>SO_PEERCRED</code> + <code>AuthPolicy</code>), run-as uid pinning, submitter in the audit log, seccomp denylist — all landed.</li>
+        </ul>
+      </details>
+      <details class="tier">
+        <summary><span class="tl pill todo">Tier 1</span> Availability &amp; durability architecture <span class="chev">›</span></summary>
+        <ul>
+          <li>Document the single-node ceiling (RPO/RTO, single-disk assumption, in-doubt-until-same-host-replays).</li>
+          <li>Wire-protocol version field + negotiation on every request.</li>
+          <li>On-disk format version headers (WAL, checkpoint, journals) + migration path.</li>
+        </ul>
+      </details>
+      <details class="tier">
+        <summary><span class="tl pill todo">Tier 2</span> Resource safety / DoS <span class="chev">›</span></summary>
+        <ul>
+          <li>Cap request / manifest size (unbounded line reads can OOM the daemon).</li>
+          <li>Admission control: in-flight semaphore, connection-count limit, idle timeout.</li>
+          <li>Per-step cgroup limits (<code>memory.max</code>, <code>pids.max</code>, <code>cpu.max</code>); staging-space quota + pre-flight disk-free check.</li>
+          <li>Automatic orphan-journal GC.</li>
+        </ul>
+      </details>
+      <details class="tier">
+        <summary><span class="tl pill todo">Tier 3</span> Operability &amp; observability <span class="chev">›</span></summary>
+        <ul>
+          <li>Metrics export (Prometheus/OTLP): commit latency, in-doubt count, fsync rate, batch sizes, staging usage.</li>
+          <li>Health / readiness endpoint; structured JSON logs with txid-correlated spans.</li>
+          <li>Bounded graceful shutdown; packaging (systemd unit, container image, config file).</li>
+        </ul>
+      </details>
+      <details class="tier">
+        <summary><span class="tl pill todo">Tier 4</span> Release engineering / supply chain <span class="chev">›</span></summary>
+        <ul>
+          <li>CI running <code>cargo test</code>, clippy, the crash harness and the TLA⁺ check.</li>
+          <li>Pinned toolchain + MSRV + <code>clippy.toml</code>; <code>cargo-audit</code>/<code>cargo-deny</code> + SBOM; CHANGELOG + semver.</li>
+        </ul>
+      </details>
+      <details class="tier">
+        <summary><span class="tl pill todo">Tier 5</span> Verification depth <span class="chev">›</span></summary>
+        <ul>
+          <li>Whole-engine deterministic simulation (madsim/turmoil); <code>loom</code>/<code>shuttle</code> for concurrency.</li>
+          <li>Real-disk fault injection (dm-flakey); fuzz the WAL, TOML and JSON parsers; trace-validate TLC against the Rust state machine.</li>
+        </ul>
+      </details>
+
+      <div class="callout warn" style="margin-top:26px">
+        <span class="ci"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></span>
+        <p><b>Known rough edges.</b> <code>cgroup.events</code> is polled every 5&nbsp;ms while draining a killed cgroup (an inotify watch is planned). Overlay copy-up of large files is a full copy (inherent to overlayfs). Multi-path publishes are crash-atomic but not instantaneous for unmanaged readers — use a single swappable directory where that matters.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="logomark">tx</span> <span>txp</span></a>
+    <span>Transactional processes — all-or-nothing filesystem + sandboxed-process execution. Licensed MIT&nbsp;OR&nbsp;Apache-2.0.</span>
+    <a href="https://github.com/artech-git/holon" target="_blank" rel="noopener">github.com/artech-git/holon ↗</a>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/rust.min.js"></script>
+<script>
+(function(){
+  "use strict";
+  var root=document.documentElement;
+
+  /* ---- theme ---- */
+  try{var saved=localStorage.getItem('txp-theme'); if(saved) root.setAttribute('data-theme',saved);}catch(e){}
+  var tb=document.getElementById('themeBtn');
+  if(tb) tb.addEventListener('click',function(){
+    var next=root.getAttribute('data-theme')==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('txp-theme',next);}catch(e){}
+  });
+
+  /* ---- mobile nav ---- */
+  var side=document.getElementById('side'),mb=document.getElementById('menuBtn'),scrim=document.getElementById('scrim');
+  function closeNav(){side.classList.remove('open');scrim.classList.remove('show');document.body.classList.remove('no-scroll');}
+  if(mb) mb.addEventListener('click',function(){
+    var open=side.classList.toggle('open');scrim.classList.toggle('show',open);document.body.classList.toggle('no-scroll',open);
+  });
+  if(scrim) scrim.addEventListener('click',closeNav);
+  side.querySelectorAll('a').forEach(function(a){a.addEventListener('click',closeNav);});
+
+  /* ---- scrollspy ---- */
+  var links=Array.prototype.slice.call(side.querySelectorAll('a'));
+  var map={};links.forEach(function(a){var id=a.getAttribute('href').slice(1);map[id]=a;});
+  var sections=Array.prototype.slice.call(document.querySelectorAll('section[id]'));
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      if(en.isIntersecting){
+        links.forEach(function(l){l.classList.remove('active');});
+        var a=map[en.target.id]; if(a) a.classList.add('active');
+      }
+    });
+  },{rootMargin:'-40% 0px -55% 0px',threshold:0});
+  sections.forEach(function(s){obs.observe(s);});
+
+  /* ---- copy buttons ---- */
+  document.querySelectorAll('.code .copy').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      var pre=btn.closest('.code').querySelector('pre code');
+      if(!pre) return;
+      var txt=pre.innerText;
+      navigator.clipboard.writeText(txt).then(function(){
+        var old=btn.textContent;btn.textContent='copied';setTimeout(function(){btn.textContent=old;},1400);
+      }).catch(function(){});
+    });
+  });
+
+  /* ---- highlight only the rust-tagged blocks; keep custom-colored toml/sh as-is ---- */
+  if(window.hljs){ /* reserved for future language tagging */ }
+})();
+</script>
+</body>
+</html>
