@@ -1,0 +1,21 @@
+[package]
+name = "txp-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Segmented decision log with group commit, CRC32C framing, torn-tail recovery, checkpoints."
+
+[dependencies]
+txp-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crc32c = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

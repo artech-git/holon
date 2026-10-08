@@ -1,0 +1,43 @@
+# Rebuild a site inside a sandbox and publish it atomically together with a
+# deploy stamp. Nothing under /srv/site changes unless every step succeeds.
+
+[txn]
+name = "rebuild-and-publish"
+timeout = "10m"
+
+[[resource]]
+id = "site"
+kind = "fs.tree"
+path = "/srv/site"
+mode = "write"
+
+[[resource]]
+id = "log"
+kind = "fs.tree"
+path = "/srv/deploylog"
+mode = "write"
+
+[[step]]
+id = "build"
+kind = "process"
+argv = ["/bin/sh", "-c", "set -e; mkdir -p dist; for f in src/*.md; do n=$(basename $f .md); printf '<h1>%s</h1>\n' \"$(cat $f)\" > dist/$n.html; done; rm -rf old; echo built-by-$TXP_TXID > dist/BUILD"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]
+network = "deny"
+timeout = "5m"
+
+[[step]]
+id = "verify"
+kind = "process"
+argv = ["/bin/sh", "-c", "test -s dist/index.html && grep -q built-by dist/BUILD"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]
+after = ["build"]
+
+[[step]]
+id = "stamp"
+kind = "fs.put"
+resource = "log"
+path = "last-deploy.txt"
+content = "txid=$txid\n"
+after = ["verify"]

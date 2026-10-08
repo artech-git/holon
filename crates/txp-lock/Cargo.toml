@@ -1,0 +1,12 @@
+[package]
+name = "txp-lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coordinator-level strict 2PL lock manager over hierarchical resource keys."
+
+[dependencies]
+txp-core = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }

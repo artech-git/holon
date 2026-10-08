@@ -1,0 +1,13 @@
+[package]
+name = "txp-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TOML manifest format for batch transactions: resources, steps, validation, topological order."
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

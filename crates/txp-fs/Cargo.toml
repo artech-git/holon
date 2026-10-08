@@ -1,0 +1,21 @@
+[package]
+name = "txp-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filesystem participant: same-filesystem staging, idempotent redo publish via rename/RENAME_EXCHANGE."
+
+[dependencies]
+txp-core = { workspace = true }
+txp-participant = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

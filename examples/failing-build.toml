@@ -1,0 +1,17 @@
+# The build writes files and then fails: the whole transaction aborts and
+# /srv/site is untouched.
+[txn]
+name = "failing-build"
+timeout = "1m"
+
+[[resource]]
+id = "site"
+kind = "fs.tree"
+path = "/srv/site"
+
+[[step]]
+id = "build"
+kind = "process"
+argv = ["/bin/sh", "-c", "echo junk > dist/junk.html; rm -rf src; exit 7"]
+cwd = "/srv/site"
+mounts = [{ resource = "site" }]

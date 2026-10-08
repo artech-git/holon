@@ -1,0 +1,21 @@
+[package]
+name = "txp-proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sandboxed OS-process participant: namespaces, overlayfs staging, cgroup v2 kill, Landlock, upperdir diff → redo publish."
+
+[dependencies]
+txp-core = { workspace = true }
+txp-participant = { workspace = true }
+txp-fs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

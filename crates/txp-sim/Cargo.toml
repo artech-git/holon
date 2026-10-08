@@ -1,0 +1,24 @@
+[package]
+name = "txp-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Crash-consistency harness: kill the coordinator at every crash point, recover, check atomicity."
+
+[[bin]]
+name = "txp-crashtest"
+path = "src/main.rs"
+
+[dependencies]
+txp-core = { workspace = true }
+txp-engine = { workspace = true }
+txp-wal = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

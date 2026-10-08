@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 59ebc4968fb8d65e109b5b119e4f4bd43038a646833d86c9774442f038410af1 # shrinks to lsn = 0, rec = Abort { txid: TxId(00000000000000000000000000000000) }
