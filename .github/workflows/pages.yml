@@ -1,0 +1,76 @@
+name: Build & Deploy docs site
+
+# Builds the Svelte site in web/ and deploys it to GitHub Pages.
+#
+# Triggers on a push to ANY branch (and manual dispatch), per request. Note:
+# GitHub Pages serves a SINGLE live site per repository, so when several
+# branches push, the most recent successful deploy is what is live
+# ("last push wins"). The build always runs; the deploy step publishes.
+#
+# One-time repo setup required for this to work:
+#   1. Settings → Pages → Build and deployment → Source: "GitHub Actions".
+#   2. Settings → Environments → github-pages → Deployment branches and tags:
+#      set to "No restriction" (or add the branches you want to allow),
+#      otherwise non-default branches are blocked from deploying.
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+# Least-privilege token plus the scopes the Pages deploy action needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deploys per branch; a newer push to the same branch cancels an
+# in-flight run. Deploys across branches still serialize at the Pages env.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          # Serve from https://<owner>.github.io/<repo>/ — Vite needs the sub-path.
+          BASE_PATH: /${{ github.event.repository.name }}/
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
