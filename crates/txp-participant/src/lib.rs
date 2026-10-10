@@ -167,3 +167,94 @@ pub fn id_dirname(id: &ParticipantId) -> String {
     let safe: String = id.as_str().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     format!("{}-{}", &safe[..safe.len().min(32)], hex::encode(&h[..6]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Arc;
+    use txp_core::ParticipantSpec;
+
+    /// The smallest possible adapter: nothing is ever staged.
+    struct Nop;
+
+    #[async_trait]
+    impl Participant for Nop {
+        fn id(&self) -> ParticipantId {
+            ParticipantId::new("nop:x")
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn stage(&self, _tx: &TxCtx, step: &StepSpec) -> Result<StageReport, PartError> {
+            Ok(StageReport { summary: step.id.clone(), ..Default::default() })
+        }
+        async fn prepare(&self, _tx: &TxCtx) -> Result<Vote, PartError> {
+            Ok(Vote::ReadOnly)
+        }
+        async fn commit(&self, _txid: TxId) -> Result<(), PartError> {
+            Ok(())
+        }
+        async fn abort(&self, _txid: TxId) -> Result<AbortOutcome, PartError> {
+            Ok(AbortOutcome::Discarded)
+        }
+        async fn recover(&self) -> Result<Vec<(TxId, LocalState)>, PartError> {
+            Ok(vec![])
+        }
+    }
+
+    fn ctx() -> TxCtx {
+        TxCtx { txid: TxId(1), data_dir: "/data".into(), deadline: None, outputs: Default::default() }
+    }
+
+    #[tokio::test]
+    async fn one_phase_is_unsupported_unless_an_adapter_opts_in() {
+        let p = Nop;
+        assert_eq!(p.id().as_str(), "nop:x");
+        assert_eq!(p.capabilities(), Capabilities::default());
+        let step = StepSpec { id: "s".into(), kind: "k".into(), config: serde_json::Value::Null };
+        assert_eq!(p.stage(&ctx(), &step).await.unwrap().summary, "s");
+        assert_eq!(p.prepare(&ctx()).await.unwrap(), Vote::ReadOnly);
+        p.commit(TxId(1)).await.unwrap();
+        assert_eq!(p.abort(TxId(1)).await.unwrap(), AbortOutcome::Discarded);
+        assert!(p.recover().await.unwrap().is_empty());
+        assert!(matches!(p.commit_one_phase(&ctx()).await, Err(PartError::Unsupported)));
+    }
+
+    #[test]
+    fn only_transient_errors_are_retried() {
+        let all = [
+            PartError::Transient("t".into()),
+            PartError::VoteNo("v".into()),
+            PartError::Conflict("c".into()),
+            PartError::Fatal("f".into()),
+            PartError::Unsupported,
+        ];
+        let msgs: Vec<String> = all.iter().map(|e| e.to_string()).collect();
+        assert_eq!(msgs, ["transient: t", "vote no: v", "conflict on c", "fatal: f", "unsupported"]);
+        assert_eq!(all.iter().filter(|e| e.is_transient()).count(), 1);
+    }
+
+    #[test]
+    fn id_dirname_is_safe_stable_and_distinct() {
+        let a = id_dirname(&ParticipantId::new("fs:/srv/site"));
+        assert!(a.starts_with("fs__srv_site-"), "{a}");
+        assert_eq!(a, id_dirname(&ParticipantId::new("fs:/srv/site")));
+        assert_ne!(id_dirname(&ParticipantId::new("a:b")), id_dirname(&ParticipantId::new("a/b")));
+        assert_eq!(id_dirname(&ParticipantId::new("x".repeat(100))).len(), 32 + 1 + 12);
+    }
+
+    #[test]
+    fn registry_builds_registered_kinds_only() {
+        let mut r = Registry::new("/data");
+        assert_eq!(r.data_dir(), Path::new("/data"));
+        r.register("nop", Arc::new(|_spec, _dir| Ok(Arc::new(Nop) as Arc<dyn Participant>)));
+        r.register("broken", Arc::new(|_spec, _dir| Err(PartError::Fatal("cannot".into()))));
+        assert_eq!(r.kinds(), vec!["broken", "nop"]);
+        let spec = |kind: &str| ParticipantSpec { id: ParticipantId::new("p"), kind: kind.into(), config: serde_json::Value::Null };
+        assert_eq!(r.build(&spec("nop")).unwrap().id().as_str(), "nop:x");
+        assert!(r.build(&spec("broken")).is_err());
+        let e = r.build(&spec("zz")).err().unwrap();
+        assert_eq!(e.to_string(), "fatal: no factory for participant kind \"zz\"");
+    }
+}

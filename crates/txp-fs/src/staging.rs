@@ -66,3 +66,45 @@ pub fn same_device(a: &Path, b: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata(a)?.dev() == std::fs::metadata(b)?.dev())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_root_is_a_hidden_sibling() {
+        assert_eq!(stage_root_for(Path::new("/srv/site")), Path::new("/srv/.txp-stage/site"));
+        assert_eq!(stage_root_for(Path::new("/")), Path::new("/.txp-stage/root"));
+        let sd = StageDir::open(Path::new("/srv/site"), TxId(1));
+        assert_eq!(sd.path, Path::new("/srv/.txp-stage/site").join(TxId(1).to_string()));
+    }
+
+    #[test]
+    fn discarding_a_sub_stage_removes_its_empty_txid_parent_only() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("site");
+        std::fs::create_dir(&root).unwrap();
+        let sd = StageDir::create(&root, TxId(7)).unwrap();
+        let files = StageDir { path: sd.subdir("files").unwrap() };
+        let other = sd.subdir("proc").unwrap();
+        files.discard().unwrap();
+        assert!(sd.path.exists(), "parent still used by another sub-stage");
+        StageDir { path: other }.discard().unwrap();
+        assert!(!sd.path.exists(), "empty txid parent removed");
+        // Discarding again, or a whole txid stage, is fine.
+        files.discard().unwrap();
+        StageDir::create(&root, TxId(8)).unwrap().discard().unwrap();
+        assert!(same_device(&root, &stage_root_for(&root)).unwrap());
+    }
+
+    #[test]
+    fn discard_odd_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(StageDir { path: file.join("x") }.discard().is_err());
+        StageDir { path: PathBuf::from("/nonexistent/a/b") }.discard().unwrap();
+        StageDir { path: PathBuf::new() }.discard().unwrap();
+        assert!(same_device(&file, &d.path().join("missing")).is_err());
+    }
+}

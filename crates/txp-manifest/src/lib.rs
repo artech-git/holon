@@ -339,6 +339,80 @@ content = "$txid"
         assert_eq!(o, vec!["build", "stamp"]);
     }
 
+    /// `OK` with `from` replaced by `to` (which must change something).
+    fn edit(from: &str, to: &str) -> String {
+        let t = OK.replacen(from, to, 1);
+        assert_ne!(t, OK, "{from:?} not found");
+        t
+    }
+
+    const BUILD_MOUNT: &str = "mounts = [{ resource = \"site\" }]";
+    const STAMP: &str = "id = \"stamp\"\nkind = \"fs.put\"\nresource = \"site\"\nafter = [\"build\"]\npath = \"DEPLOY\"\ncontent = \"$txid\"";
+    const RO: &str = "[[resource]]\nid = \"ro\"\nkind = \"fs.tree\"\npath = \"/srv/ro\"\nmode = \"read\"\n[[step]]";
+
+    #[test]
+    fn every_validation_rule_has_its_own_error() {
+        let stamp = |body: &str| edit(STAMP, body);
+        let cases: Vec<(String, &str)> = vec![
+            (edit("name = \"demo\"", "name = \" \""), "txn.name is required"),
+            (format!("{OK}[[effect]]\nkind = \"http.deferred\"\n"), "[[effect]]"),
+            (edit("[[step]]", "[[resource]]\nid = \"site\"\nkind = \"fs.tree\"\npath = \"/x\"\n[[step]]"), "duplicate resource id"),
+            (edit("kind = \"fs.tree\"", "kind = \"pg\""), "unsupported kind \"pg\" (supported: fs.tree)"),
+            (edit("path = \"/srv/site\"", "path = \"srv/site\""), "path must be absolute"),
+            (edit("path = \"/srv/site\"", "path = \"/srv/site\"\nmode = \"append\""), "mode must be read or write"),
+            (edit("id = \"stamp\"", "id = \"build\""), "duplicate step id"),
+            (edit("id = \"build\"", "id = \"a/b\""), "must not contain '/' or '..'"),
+            (edit("argv = [\"sh\", \"-c\", \"echo hi > x\"]", "argv = []"), "argv is required"),
+            (edit(BUILD_MOUNT, "mounts = []"), "must mount at least one resource"),
+            (edit(BUILD_MOUNT, "mounts = [{ resource = \"nope\" }]"), "unknown resource \"nope\""),
+            (edit("path = \"/srv/site\"", "path = \"/srv/site\"\nmode = \"read\""), "resource \"site\" is read-only"),
+            (edit(BUILD_MOUNT, &format!("{BUILD_MOUNT}\nnetwork = \"allow\"")), "network must be \"deny\""),
+            (edit(BUILD_MOUNT, &format!("{BUILD_MOUNT}\ntimeout = \"soon\"")), "bad duration \"soon\""),
+            (stamp("id = \"stamp\"\nkind = \"fs.put\"\npath = \"DEPLOY\"\ncontent = \"x\""), "resource is required"),
+            (stamp("id = \"stamp\"\nkind = \"fs.put\"\nresource = \"nope\"\npath = \"DEPLOY\"\ncontent = \"x\""), "unknown resource \"nope\""),
+            (edit("[[step]]", RO).replacen("resource = \"site\"\nafter", "resource = \"ro\"\nafter", 1), "resource \"ro\" is read-only"),
+            (stamp("id = \"stamp\"\nkind = \"fs.delete\"\nresource = \"site\""), "path is required"),
+            (stamp("id = \"stamp\"\nkind = \"fs.put\"\nresource = \"site\"\npath = \"DEPLOY\""), "content or source is required"),
+            (stamp("id = \"stamp\"\nkind = \"fs.replace_tree\"\nresource = \"site\"\npath = \"d\""), "source is required"),
+            (stamp("id = \"stamp\"\nkind = \"teleport\""), "unsupported kind \"teleport\""),
+            (edit("timeout = \"2m\"", "timeout = \"5 parsecs\""), "bad duration unit \"parsecs\""),
+        ];
+        for (text, want) in cases {
+            let e = Manifest::parse(&text).unwrap_err();
+            assert!(matches!(e, ManifestError::Invalid(_)), "{e}");
+            assert!(e.to_string().contains(want), "want {want:?}, got {e}\n{text}");
+        }
+        let e = Manifest::parse("[txn").unwrap_err();
+        assert!(matches!(e, ManifestError::Parse(_)) && e.to_string().starts_with("parse: "), "{e}");
+    }
+
+    #[test]
+    fn durations() {
+        for (s, secs) in [("90", 90.0), ("1.5s", 1.5), ("2 sec", 2.0), ("250ms", 0.25), ("10m", 600.0), ("3min", 180.0), ("2h", 7200.0)] {
+            assert_eq!(parse_duration(s).unwrap(), Duration::from_secs_f64(secs), "{s}");
+        }
+        assert!(parse_duration("m").is_err());
+        assert!(parse_duration("1.2.3s").is_err());
+    }
+
+    #[test]
+    fn accepted_variants_and_defaults() {
+        let m = Manifest::parse(&format!(
+            "{}{}",
+            edit(BUILD_MOUNT, &format!("{BUILD_MOUNT}\nnetwork = \"deny\"\ntimeout = \"30s\"")).replace("timeout = \"2m\"\n", ""),
+            "[[step]]\nid = \"swap\"\nkind = \"fs.replace_tree\"\nresource = \"site\"\npath = \"d\"\nsource = \"/tmp/d\"\n\
+             [[step]]\nid = \"rm\"\nkind = \"fs.delete\"\nresource = \"site\"\npath = \"old\"\nafter = [\"stamp\", \"swap\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(m.timeout().unwrap(), Duration::from_secs(600));
+        assert_eq!(m.resource("site").unwrap().mode, "write");
+        assert!(m.resource("nope").is_none());
+        // `rm` waits for two steps; it is ready only after both.
+        let o: Vec<_> = m.ordered_steps().unwrap().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(o, vec!["build", "stamp", "swap", "rm"]);
+        assert_eq!(Manifest::digest("x"), "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881");
+    }
+
     #[test]
     fn rejects_cycle_and_unknown() {
         let bad = OK.replace("after = [\"build\"]", "after = [\"nope\"]");

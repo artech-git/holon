@@ -11,11 +11,15 @@ txp-participant = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "user"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+nix = { workspace = true, features = ["mount", "user"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

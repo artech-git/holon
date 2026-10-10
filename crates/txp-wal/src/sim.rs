@@ -4,7 +4,8 @@
 //! volatile image; `datasync`/`fsync` copy it to durable. `crash()` discards
 //! the volatile image except for a random subset of 512-byte sectors (torn
 //! writes). `fail_next_sync` makes the next sync return EIO so tests can
-//! assert the writer aborts instead of retrying.
+//! assert the writer aborts instead of retrying; `fail_next_dir_sync` does
+//! the same for directory syncs only.
 
 use crate::disk::{Disk, SegmentHandle};
 use parking_lot::Mutex;
@@ -28,6 +29,9 @@ pub struct SimState {
     /// When set, the next `datasync`/`fsync`/`fsync_dir` fails with `EIO`
     /// and clears the flag.
     pub fail_next_sync: bool,
+    /// When set, the next `fsync_dir` fails with `EIO` and clears the flag;
+    /// file syncs are unaffected.
+    pub fail_next_dir_sync: bool,
     /// Successful syncs so far.
     pub syncs: u64,
     /// `write_at` calls so far.
@@ -74,6 +78,8 @@ impl SimDisk {
         }
         let mut ri = 0;
         for img in s.files.values_mut() {
+            // `out` is at least as long as the volatile image, so every
+            // surviving sector fits.
             let len = img.volatile.len().max(img.durable.len());
             let mut out = img.durable.clone();
             out.resize(len, 0);
@@ -83,9 +89,6 @@ impl SimDisk {
                 let keep = (rolls[ri % rolls.len()] >> (ri % 60)) & 1 == 1;
                 ri += 1;
                 if keep {
-                    if out.len() < end {
-                        out.resize(end, 0);
-                    }
                     out[off..end].copy_from_slice(&img.volatile[off..end]);
                 }
                 off = end;
@@ -98,6 +101,11 @@ impl SimDisk {
     /// Make the next sync fail with `EIO`.
     pub fn set_fail_next_sync(&self) {
         self.state.lock().fail_next_sync = true;
+    }
+
+    /// Make the next directory sync fail with `EIO`.
+    pub fn set_fail_next_dir_sync(&self) {
+        self.state.lock().fail_next_dir_sync = true;
     }
 }
 
@@ -133,7 +141,7 @@ impl SegmentHandle for SimHandle {
         let mut s = self.state.lock();
         if s.fail_next_sync {
             s.fail_next_sync = false;
-            return Err(io::Error::from_raw_os_error(libc::EIO));
+            return Err(io::Error::from(nix::errno::Errno::EIO));
         }
         s.syncs += 1;
         let f = s.files.get_mut(&self.path).ok_or_else(|| io::Error::other("no file"))?;
@@ -207,13 +215,110 @@ impl Disk for SimDisk {
     }
     fn fsync_dir(&self, _dir: &Path) -> io::Result<()> {
         let mut s = self.state.lock();
-        if s.fail_next_sync {
-            s.fail_next_sync = false;
-            return Err(io::Error::from_raw_os_error(libc::EIO));
+        if std::mem::take(&mut s.fail_next_dir_sync) || std::mem::take(&mut s.fail_next_sync) {
+            return Err(io::Error::from(nix::errno::Errno::EIO));
         }
         Ok(())
     }
     fn create_dir_all(&self, _dir: &Path) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eio(r: io::Result<()>) -> bool {
+        r.unwrap_err().raw_os_error() == Some(nix::libc::EIO)
+    }
+
+    #[test]
+    fn handles_read_write_and_resize_the_volatile_image() {
+        let disk = SimDisk::new(0);
+        let p = Path::new("/d/f");
+        let mut h = disk.create(p).unwrap();
+        assert_eq!(disk.create(p).err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
+        h.write_at(4, b"abcd").unwrap();
+        assert_eq!(h.len().unwrap(), 8);
+        let mut buf = [9u8; 6];
+        assert_eq!(h.read_at(2, &mut buf).unwrap(), 6);
+        assert_eq!(buf, [0, 0, b'a', b'b', b'c', b'd']);
+        assert_eq!(h.read_at(8, &mut buf).unwrap(), 0);
+        h.preallocate(16).unwrap();
+        h.preallocate(4).unwrap();
+        assert_eq!(h.len().unwrap(), 16);
+        h.truncate(6).unwrap();
+        assert_eq!(disk.read_all(p).unwrap(), vec![0, 0, 0, 0, b'a', b'b']);
+        h.fsync().unwrap();
+        assert_eq!(disk.state().lock().syncs, 1);
+        assert_eq!(disk.state().lock().writes, 1);
+
+        // Once the file is gone, its handle fails (and has no length).
+        disk.remove(p).unwrap();
+        assert!(h.write_at(0, b"x").is_err());
+        assert!(h.read_at(0, &mut buf).is_err());
+        assert!(h.datasync().is_err());
+        assert!(h.preallocate(1).is_err());
+        assert!(h.truncate(1).is_err());
+        assert_eq!(h.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn injected_sync_failures_are_one_shot() {
+        let disk = SimDisk::new(0);
+        let mut h = disk.create(Path::new("/d/f")).unwrap();
+        disk.set_fail_next_sync();
+        assert!(eio(h.datasync()));
+        h.datasync().unwrap();
+        disk.set_fail_next_sync();
+        assert!(eio(disk.fsync_dir(Path::new("/d"))));
+        disk.set_fail_next_dir_sync();
+        h.datasync().unwrap();
+        assert!(eio(disk.fsync_dir(Path::new("/d"))));
+        disk.fsync_dir(Path::new("/d")).unwrap();
+        disk.create_dir_all(Path::new("/d")).unwrap();
+    }
+
+    #[test]
+    fn directory_operations() {
+        let disk = SimDisk::new(0);
+        assert_eq!(disk.open(Path::new("/d/x")).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        assert_eq!(disk.read_all(Path::new("/d/x")).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        assert_eq!(disk.rename(Path::new("/d/x"), Path::new("/d/y")).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        disk.write_atomic(Path::new("/d/x"), b"data").unwrap();
+        disk.write_atomic(Path::new("/elsewhere/z"), b"").unwrap();
+        disk.rename(Path::new("/d/x"), Path::new("/d/y")).unwrap();
+        assert!(!disk.exists(Path::new("/d/x")));
+        assert!(disk.open(Path::new("/d/y")).is_ok());
+        assert_eq!(disk.list(Path::new("/d")).unwrap(), vec![PathBuf::from("/d/y")]);
+        // write_atomic is durable at once: a crash keeps it whole.
+        disk.crash();
+        assert_eq!(disk.read_all(Path::new("/d/y")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn crash_keeps_durable_bytes_and_some_unsynced_sectors() {
+        let disk = SimDisk::new(42);
+        let p = Path::new("/d/f");
+        let mut h = disk.create(p).unwrap();
+        h.write_at(0, &[1u8; SECTOR]).unwrap();
+        h.datasync().unwrap();
+        // Unsynced: sectors 1.. of 2s, plus a shrink of nothing durable.
+        h.write_at(SECTOR as u64, &vec![2u8; 40 * SECTOR]).unwrap();
+        disk.crash();
+        let after = disk.read_all(p).unwrap();
+        assert_eq!(&after[..SECTOR], &[1u8; SECTOR][..], "durable sector survives");
+        let kept = after[SECTOR..].chunks(SECTOR).filter(|c| c[0] == 2).count();
+        assert!(kept > 0 && kept < 40, "some but not all unsynced sectors survive: {kept}");
+
+        // A file shorter in memory than on disk keeps its durable length.
+        let q = Path::new("/d/g");
+        let mut g = disk.create(q).unwrap();
+        g.write_at(0, &[3u8; 100]).unwrap();
+        g.datasync().unwrap();
+        g.truncate(10).unwrap();
+        disk.crash();
+        assert_eq!(disk.read_all(q).unwrap().len(), 100);
     }
 }

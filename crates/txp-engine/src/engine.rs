@@ -94,7 +94,7 @@ impl EngineConfig {
         let sudo_gid: Option<u32> = std::env::var("SUDO_GID").ok().and_then(|s| s.parse().ok());
         let uid = sudo_uid.unwrap_or(65534);
         let gid = sudo_gid.unwrap_or(65534);
-        let owner_uid = sudo_uid.unwrap_or_else(|| unsafe { libc::geteuid() });
+        let owner_uid = sudo_uid.unwrap_or_else(|| nix::unistd::geteuid().as_raw());
         EngineConfig {
             data_dir: data_dir.into(),
             wal: WalConfig::default(),
@@ -198,17 +198,28 @@ where
     }
 }
 
+/// `on_slow` for retries whose slowness nobody needs to hear about.
+fn unreported(_: &str) {}
+
 type Parts = HashMap<ParticipantId, Arc<dyn Participant>>;
 
 impl Engine {
     /// Open the log, recover, and (if recovery succeeds) start accepting.
     pub async fn open(cfg: EngineConfig) -> Result<(Engine, RecoveryReport), EngineError> {
+        Self::open_with(cfg, |_| {}).await
+    }
+
+    /// [`Engine::open`], letting `customize` adjust the participant registry
+    /// (which already knows `fs` and `proc`) before recovery uses it, e.g. to
+    /// add an adapter kind or wrap an existing one.
+    pub async fn open_with(cfg: EngineConfig, customize: impl FnOnce(&mut Registry)) -> Result<(Engine, RecoveryReport), EngineError> {
         std::fs::create_dir_all(&cfg.data_dir)?;
         let (wal, recovered) = Wal::open(Arc::new(RealDisk), &cfg.data_dir.join("wal"), cfg.wal.clone())
             .map_err(|e| EngineError::Recovery(e.to_string()))?;
         let mut registry = Registry::new(&cfg.data_dir);
         registry.register("fs", Arc::new(txp_fs::FsParticipant::factory));
         registry.register("proc", Arc::new(txp_proc::ProcParticipant::factory));
+        customize(&mut registry);
         let eng = Engine {
             inner: Arc::new(Inner {
                 cfg,
@@ -282,9 +293,7 @@ impl Engine {
     }
 
     fn update(&self, txid: TxId, f: impl FnOnce(&mut TxStatus)) {
-        if let Some(s) = self.inner.status.lock().get_mut(&txid) {
-            f(s);
-        }
+        self.inner.status.lock().entry(txid).and_modify(f);
     }
 
     fn build_parts(&self, specs: &[ParticipantSpec]) -> Result<Parts, PartError> {
@@ -453,7 +462,7 @@ impl Engine {
             });
             let p = parts[&staged[0]].clone();
             let c = ctx.clone();
-            let r = retry("commit_one_phase", None, self.inner.cfg.in_doubt_after, |_| {}, || {
+            let r = retry("commit_one_phase", None, self.inner.cfg.in_doubt_after, unreported, || {
                 let p = p.clone();
                 let c = c.clone();
                 async move { p.commit_one_phase(&c).await }
@@ -482,7 +491,7 @@ impl Engine {
             let c = ctx.clone();
             let id = id.clone();
             js.spawn(async move {
-                let r = retry("prepare", Some(deadline), Duration::from_secs(3600), |_| {}, || {
+                let r = retry("prepare", Some(deadline), Duration::from_secs(3600), unreported, || {
                     let p = p.clone();
                     let c = c.clone();
                     async move { p.prepare(&c).await }
@@ -629,7 +638,7 @@ impl Engine {
             let id = id.clone();
             let first_done = first_done.clone();
             js.spawn(async move {
-                let r = retry("abort", None, Duration::from_secs(60), |_| {}, || {
+                let r = retry("abort", None, Duration::from_secs(60), unreported, || {
                     let p = p.clone();
                     async move { p.abort(txid).await }
                 })
@@ -697,11 +706,10 @@ impl Engine {
                 txp_core::RecoveryAction::RedriveCommit { commit_set, .. } => {
                     tracing::info!(%txid, "recovery: re-driving commit");
                     let proof = DurableCommit::mint(txid, self.inner.wal.table().lock().get(txid).map(|e| e.last_lsn).unwrap_or_default());
-                    let out = self.phase_two(&proof, &parts, &commit_set).await;
-                    match out {
-                        TxOutcome::Committed => report.redriven_commits.push(txid),
-                        TxOutcome::InDoubt { error, .. } => report.in_doubt.push((txid, error.clone())),
-                        TxOutcome::Aborted { .. } => unreachable!("phase two never aborts"),
+                    // Phase two only ever commits or stays in doubt.
+                    match self.phase_two(&proof, &parts, &commit_set).await {
+                        TxOutcome::InDoubt { error, .. } => report.in_doubt.push((txid, error)),
+                        _ => report.redriven_commits.push(txid),
                     }
                     self.update(txid, |s| s.outcome = Some(TxOutcome::Committed));
                 }
@@ -764,6 +772,47 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec(kind: &str, config: serde_json::Value) -> ParticipantSpec {
+        ParticipantSpec { id: ParticipantId::new(kind), kind: kind.into(), config }
+    }
+
+    #[test]
+    fn recovery_relocks_every_managed_root() {
+        let specs = [
+            spec("fs", serde_json::json!({"root": "/srv/a"})),
+            spec("fs", serde_json::json!({})),
+            spec("proc", serde_json::json!({"mounts": [{"root": "/srv/b"}, {"resource": "no root"}]})),
+            spec("proc", serde_json::json!({})),
+            spec("pg", serde_json::json!({"root": "/ignored"})),
+        ];
+        let keys: Vec<String> = lock_keys_for(&specs).into_iter().map(|(k, m)| format!("{} {m:?}", k.0)).collect();
+        assert_eq!(keys, ["fs:/srv/a Exclusive", "fs:/srv/b Exclusive"]);
+    }
+
+    #[tokio::test]
+    async fn retry_backs_off_on_transient_errors_only() {
+        // Transient twice, then success; slowness is reported once.
+        let calls = std::cell::Cell::new(0);
+        let mut slow = Vec::new();
+        let mut report = |e: &str| slow.push(e.to_string());
+        let r = retry("op", None, Duration::ZERO, &mut report, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move { if n < 3 { Err(PartError::Transient(format!("try {n}"))) } else { Ok(n) } }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 3);
+        // A deadline too close for the next backoff gives up.
+        let soon = Some(Instant::now() + Duration::from_millis(1));
+        let r: Result<(), _> = retry("op", soon, Duration::from_secs(60), &mut report, || async { Err(PartError::Transient("busy".into())) }).await;
+        assert!(r.unwrap_err().to_string().contains("op: deadline exceeded after 1 attempts: transient: busy"));
+        // Anything else is returned at once.
+        let r: Result<(), _> = retry("op", None, Duration::ZERO, &mut report, || async { Err(PartError::VoteNo("no".into())) }).await;
+        assert!(matches!(r, Err(PartError::VoteNo(_))));
+        unreported("not reported");
+        assert_eq!(slow, ["transient: try 1"]);
+    }
 
     #[test]
     fn auth_policy_allows_root_owner_and_listed_only() {

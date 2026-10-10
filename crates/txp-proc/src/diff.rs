@@ -5,7 +5,7 @@
 //! nodes, fifos, sockets, `redirect`/`metacopy` xattrs. The overlay must be
 //! unmounted (its mount namespace is gone) before this runs.
 
-use std::ffi::CString;
+use nix::errno::Errno;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -15,42 +15,31 @@ const OPAQUE: &str = "trusted.overlay.opaque";
 const REDIRECT: &str = "trusted.overlay.redirect";
 const METACOPY: &str = "trusted.overlay.metacopy";
 
+/// The filesystem has no xattr support: there is nothing to read or list.
+fn unsupported(e: &io::Error) -> bool {
+    e.raw_os_error().map(Errno::from_raw) == Some(Errno::ENOTSUP)
+}
+
+// The `xattr` crate's plain functions are the `l*` variants: they act on a
+// symlink itself rather than its target.
+
 fn lgetxattr(p: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
-    let cp = CString::new(p.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
-    let cn = CString::new(name).map_err(io::Error::other)?;
-    let mut buf = vec![0u8; 256];
-    let r = unsafe { libc::lgetxattr(cp.as_ptr(), cn.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if r < 0 {
-        let e = io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
-            _ => Err(e),
-        };
-    }
-    buf.truncate(r as usize);
-    Ok(Some(buf))
+    xattr::get(p, name).or_else(|e| if unsupported(&e) { Ok(None) } else { Err(e) })
 }
 
 fn llistxattr(p: &Path) -> io::Result<Vec<String>> {
-    let cp = CString::new(p.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
-    let mut buf = vec![0u8; 4096];
-    let r = unsafe { libc::llistxattr(cp.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if r < 0 {
-        let e = io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::ENOTSUP) => Ok(vec![]),
-            _ => Err(e),
-        };
-    }
-    buf.truncate(r as usize);
-    Ok(buf.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect())
+    let names = xattr::list(p).map(|names| names.map(|n| n.to_string_lossy().into_owned()).collect());
+    // Local filesystems answer an empty list; FUSE or NFS may refuse.
+    names.or_else(|e| if unsupported(&e) { Ok(vec![]) } else { Err(e) })
+}
+
+/// An overlay xattr of `p`, with any failure as a message.
+fn overlay_xattr(p: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    lgetxattr(p, name).map_err(|e| format!("getxattr {}: {e}", p.display()))
 }
 
 fn lremovexattr(p: &Path, name: &str) -> io::Result<()> {
-    let cp = CString::new(p.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
-    let cn = CString::new(name).map_err(io::Error::other)?;
-    let r = unsafe { libc::lremovexattr(cp.as_ptr(), cn.as_ptr()) };
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    xattr::remove(p, name)
 }
 
 fn is_whiteout(m: &std::fs::Metadata) -> bool {
@@ -122,11 +111,8 @@ fn walk(upper: &Path, root: &Path, rel: &Path, out: &mut Vec<RedoOp>) -> Result<
             continue;
         }
         if m.is_dir() {
-            let opaque = lgetxattr(&staged, OPAQUE)
-                .map_err(|e| format!("getxattr {}: {e}", staged.display()))?
-                .map(|v| v == b"y")
-                .unwrap_or(false);
-            if lgetxattr(&staged, REDIRECT).map_err(|e| e.to_string())?.is_some() {
+            let opaque = overlay_xattr(&staged, OPAQUE)?.is_some_and(|v| v == b"y");
+            if overlay_xattr(&staged, REDIRECT)?.is_some() {
                 return Err(format!("{}: directory rename (redirect) is not supported", staged.display()));
             }
             if opaque {
@@ -183,12 +169,47 @@ mod tests {
     }
 
     #[test]
+    fn foreign_xattrs_stay_and_hard_links_are_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let upper = d.path().join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::write(upper.join("f"), "x").unwrap();
+        xattr::set(upper.join("f"), "user.keep", b"1").unwrap();
+        assert_eq!(translate(&upper, d.path()).unwrap().len(), 1);
+        assert_eq!(xattr::get(upper.join("f"), "user.keep").unwrap(), Some(b"1".to_vec()), "only overlay xattrs are stripped");
+        std::fs::hard_link(upper.join("f"), upper.join("g")).unwrap();
+        assert!(translate(&upper, d.path()).unwrap_err().contains("hard links are not supported"));
+    }
+
+    #[test]
+    fn a_missing_upper_is_no_change_and_an_unreadable_one_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        assert!(translate(&d.path().join("none"), d.path()).unwrap().is_empty());
+        let upper = d.path().join("upper");
+        std::fs::create_dir_all(upper.join("sub")).unwrap();
+        std::fs::set_permissions(upper.join("sub"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = translate(&upper, d.path());
+        std::fs::set_permissions(upper.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // (root reads it anyway)
+        assert!(r.is_err() || nix::unistd::geteuid().is_root(), "{r:?}");
+    }
+
+    #[test]
+    fn xattr_reads_tolerate_filesystems_without_xattrs() {
+        // procfs supports none: nothing to read, rather than an error.
+        assert_eq!(lgetxattr(Path::new("/proc/self/status"), OPAQUE).unwrap(), None);
+        assert!(lgetxattr(Path::new("/nonexistent"), OPAQUE).is_err());
+        assert!(llistxattr(Path::new("/nonexistent")).is_err());
+        assert!(overlay_xattr(Path::new("/nonexistent"), OPAQUE).unwrap_err().starts_with("getxattr /nonexistent: "));
+    }
+
+    #[test]
     fn rejects_fifo() {
         let d = tempfile::tempdir().unwrap();
         let upper = d.path().join("upper");
         std::fs::create_dir_all(&upper).unwrap();
-        let p = CString::new(upper.join("f").to_string_lossy().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(p.as_ptr(), 0o644) }, 0);
+        nix::unistd::mkfifo(&upper.join("f"), nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
         assert!(translate(&upper, d.path()).is_err());
     }
 }

@@ -366,6 +366,110 @@ mod tests {
         assert_eq!(e, ApplyError::ContradictsCommit(TxId(1)));
     }
 
+    fn force(t: u128, decision: Decision) -> LogRecord {
+        LogRecord::ForceResolve { txid: TxId(t), decision, reason: "op".into() }
+    }
+
+    #[test]
+    fn lsn_must_increase_after_the_first_record() {
+        let mut t = TxnTable::new();
+        assert_eq!(t.applied_lsn(), Lsn::ZERO);
+        t.apply(Lsn(5), &begin(1)).unwrap();
+        assert_eq!(t.applied_lsn(), Lsn(5));
+        let e = t.apply(Lsn(5), &begin(2)).unwrap_err();
+        assert_eq!(e, ApplyError::NonMonotonicLsn { lsn: Lsn(5), applied: Lsn(5) });
+        assert_eq!(e.to_string(), "non-monotonic lsn 5 after 5");
+    }
+
+    #[test]
+    fn records_for_unknown_transactions_are_rejected() {
+        let recs = [
+            LogRecord::Prepared { txid: TxId(9), votes: vec![] },
+            LogRecord::Commit { txid: TxId(9), participants: vec![] },
+            LogRecord::Abort { txid: TxId(9) },
+            LogRecord::Done { txid: TxId(9) },
+            force(9, Decision::Commit),
+        ];
+        for (i, r) in recs.iter().enumerate() {
+            let mut t = TxnTable::new();
+            assert_eq!(t.apply(Lsn(i as u64 + 1), r), Err(ApplyError::UnknownTxn(TxId(9))), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn replays_are_idempotent_and_commit_after_abort_is_illegal() {
+        let mut t = TxnTable::new();
+        t.apply(Lsn(1), &begin(1)).unwrap();
+        t.apply(Lsn(2), &LogRecord::Prepared { txid: TxId(1), votes: vec![] }).unwrap();
+        assert_eq!(t.get(TxId(1)).unwrap().last_lsn, Lsn(2));
+        let commit = LogRecord::Commit { txid: TxId(1), participants: vec![ParticipantId::new("a")] };
+        t.apply(Lsn(3), &commit).unwrap();
+        t.apply(Lsn(4), &commit).unwrap();
+        let e = t.get(TxId(1)).unwrap();
+        assert_eq!((e.phase, e.last_lsn, e.commit_set.len()), (TxPhase::Committing, Lsn(4), 1));
+
+        t.apply(Lsn(5), &begin(2)).unwrap();
+        t.apply(Lsn(6), &LogRecord::Abort { txid: TxId(2) }).unwrap();
+        t.apply(Lsn(7), &LogRecord::Abort { txid: TxId(2) }).unwrap();
+        assert_eq!(t.get(TxId(2)).unwrap().phase, TxPhase::Aborting);
+        let e = t.apply(Lsn(8), &LogRecord::Commit { txid: TxId(2), participants: vec![] }).unwrap_err();
+        assert_eq!(e, ApplyError::IllegalTransition { txid: TxId(2), from: TxPhase::Aborting, record: "commit" });
+        assert!(e.to_string().starts_with("illegal transition for"), "{e}");
+        assert!(matches!(t.recovery_actions()[1], RecoveryAction::RedriveAbort { txid: TxId(2), .. }));
+        assert_eq!(t.recovery_actions().iter().map(|a| a.txid()).collect::<Vec<_>>(), vec![TxId(1), TxId(2)]);
+
+        // Done twice is fine; it leaves an aborted transaction resolvable.
+        t.apply(Lsn(9), &LogRecord::Done { txid: TxId(2) }).unwrap();
+        t.apply(Lsn(10), &LogRecord::Done { txid: TxId(2) }).unwrap();
+        assert_eq!(t.resolve(TxId(2)), Decision::Abort);
+    }
+
+    #[test]
+    fn force_resolve_follows_the_decision_rules() {
+        let mut t = TxnTable::new();
+        for i in 1..=4 {
+            t.apply(Lsn(i as u64), &begin(i)).unwrap();
+        }
+        // Started + abort, and again once Aborting.
+        t.apply(Lsn(5), &force(1, Decision::Abort)).unwrap();
+        t.apply(Lsn(6), &force(1, Decision::Abort)).unwrap();
+        let e = t.get(TxId(1)).unwrap();
+        assert_eq!((e.phase, e.forced.as_deref()), (TxPhase::Aborting, Some("op")));
+        // Aborting + commit contradicts the earlier decision.
+        let err = t.apply(Lsn(7), &force(1, Decision::Commit)).unwrap_err();
+        assert_eq!(err, ApplyError::IllegalTransition { txid: TxId(1), from: TxPhase::Aborting, record: "force_resolve" });
+        // Started + commit commits everyone from Begin; a second commit is a no-op.
+        t.apply(Lsn(8), &force(2, Decision::Commit)).unwrap();
+        t.apply(Lsn(9), &force(2, Decision::Commit)).unwrap();
+        let e = t.get(TxId(2)).unwrap();
+        assert_eq!(e.phase, TxPhase::Committing);
+        assert_eq!(e.commit_set, vec![ParticipantId::new("a"), ParticipantId::new("b")]);
+        assert_eq!(t.resolve(TxId(2)), Decision::Commit);
+        // Done stays Done whatever the operator says, but the reason is kept.
+        t.apply(Lsn(10), &LogRecord::Done { txid: TxId(3) }).unwrap();
+        t.apply(Lsn(11), &force(3, Decision::Abort)).unwrap();
+        t.apply(Lsn(12), &force(3, Decision::Commit)).unwrap();
+        let e = t.get(TxId(3)).unwrap();
+        assert_eq!((e.phase, e.forced.as_deref(), e.last_lsn), (TxPhase::Done, Some("op"), Lsn(12)));
+        assert_eq!(ApplyError::ContradictsCommit(TxId(2)).to_string(), format!("force_resolve(abort) on {} contradicts a durable Commit", TxId(2)));
+        assert_eq!(ApplyError::UnknownTxn(TxId(2)).to_string(), format!("record for unknown transaction {} (no Begin seen)", TxId(2)));
+    }
+
+    #[test]
+    fn oldest_in_flight_and_gc_ignore_done_entries() {
+        let mut t = TxnTable::new();
+        assert_eq!(t.oldest_in_flight_lsn(), None);
+        t.apply(Lsn(1), &begin(1)).unwrap();
+        t.apply(Lsn(2), &begin(2)).unwrap();
+        assert_eq!(t.oldest_in_flight_lsn(), Some(Lsn(1)));
+        t.apply(Lsn(3), &LogRecord::Done { txid: TxId(1) }).unwrap();
+        assert_eq!(t.oldest_in_flight_lsn(), Some(Lsn(2)));
+        assert_eq!(t.entries().count(), 2);
+        t.gc_done();
+        assert_eq!(t.entries().map(|e| e.txid).collect::<Vec<_>>(), vec![TxId(2)]);
+        assert!(t.get(TxId(1)).is_none());
+    }
+
     #[test]
     fn snapshot_roundtrip_equals_replay() {
         let mut t = TxnTable::new();

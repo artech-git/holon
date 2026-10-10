@@ -24,6 +24,7 @@ Landlock ABI 6), Rust nightly 1.101 (2026-10-04). Date: 2026-10-06.
 | Daemon + CLI; status, list, in-doubt, orphans, locks, wal stats, checkpoint, self-test, offline wal dump | ✅ | txp-server, txp-cli |
 | Submission authorization (`SO_PEERCRED` + allow policy), per-submitter uid pinning, submitter recorded in `Begin`, seccomp syscall denylist | ✅ root test asserts the step runs under seccomp filter mode | txp-server, txp-engine, txp-core, txp-proc |
 | Phase-1 exit criteria: crash at every protocol point never yields a partial publish; recovery re-drives Commit-without-Done; 1PC issues exactly one forced write (the participant's); group commit batches >1 under load | ✅ `txp-crashtest`, `wal_tests::group_commit_batches_under_concurrency`, engine tests | txp-sim |
+| 100% line coverage of every `src/` file (3990/3990), root-only suites included: fault-injected participants (`engine_faults.rs`), every WAL `fatal()` abort path in a child process, txpd/txp end to end, sandbox helper protocol | ✅ `scripts/coverage.sh` (cargo-llvm-cov in continuous mode, so aborting, SIGKILLed and exec'ing processes record too) | all |
 
 ## Deviations from the document (and why)
 
@@ -37,10 +38,19 @@ Landlock ABI 6), Rust nightly 1.101 (2026-10-04). Date: 2026-10-06.
 - **Egress is "deny" only** (network namespace without interfaces). The
   deferred-egress proxy / outbox is Phase 3.
 - **seccomp denylist applied** (txp-proc `seccomp.rs`), additive to namespaces
-  + Landlock (fs) + unprivileged uid + `no_new_privs`: a hand-built cBPF filter
-  refuses a fixed set of administrative / exploit-primitive syscalls with
-  `EPERM`, installed fail-closed in the confined grandchild. A strict allowlist
-  is not attempted (it would break ordinary build tools).
+  + Landlock (fs) + unprivileged uid + `no_new_privs`: a `seccompiler`-built
+  filter refuses a fixed set of administrative / exploit-primitive syscalls
+  with `EPERM` (a foreign syscall ABI kills the process), installed fail-closed
+  in the confined init process. A strict allowlist is not attempted (it would
+  break ordinary build tools).
+- **No `unsafe` code** (`unsafe_code = "forbid"` workspace-wide). Syscalls go
+  through `nix`; Landlock, seccomp and xattrs through the `landlock`,
+  `seccompiler` and `xattr` crates. Because running code between `fork` and
+  `exec` needs `unsafe` `pre_exec`, the daemon instead starts the
+  **`txp-sandbox` helper binary** (txp-proc), which unshares the namespaces and
+  re-executes itself as PID 1 to confine and `exec` the step. It must be
+  installed next to `txpd` (or named by `TXP_SANDBOX_HELPER`); `txpd` warns at
+  startup and `self-test` reports `sandbox_helper` when it is missing.
 - **Crash testing uses deterministic crash points (`TXP_CRASH_AT`) and a
   simulated disk at the WAL layer**, not yet whole-engine deterministic
   simulation (turmoil/madsim) or a dm-flakey VM harness.

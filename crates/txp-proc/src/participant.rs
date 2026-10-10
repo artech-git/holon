@@ -230,8 +230,9 @@ impl Participant for ProcParticipant {
             output_limit: 64 * 1024,
         };
         // Detached task: a dropped caller future must not leave the process
-        // running unobserved; abort() kills via the cgroup in that case.
-        let res = tokio::spawn(sandbox::run(spec)).await.map_err(|e| PartError::Fatal(e.to_string()))?;
+        // running unobserved; abort() kills via the cgroup in that case. A
+        // panicking task is reported like any other sandbox error, after cleanup.
+        let res = tokio::spawn(sandbox::run(spec)).await.map_err(std::io::Error::from).and_then(std::convert::identity);
         let _ = cg.destroy().await;
         self.running.lock().remove(&tx.txid);
         let res = res.map_err(|e| PartError::Fatal(format!("sandbox: {e}")))?;
@@ -323,5 +324,141 @@ impl Participant for ProcParticipant {
 
     async fn recover(&self) -> Result<Vec<(TxId, LocalState)>, PartError> {
         self.journal.list().map_err(io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(root: &Path) -> ProcConfig {
+        let c = serde_json::json!({ "step": "build", "argv": ["true"], "mounts": [{ "resource": "r", "root": root }], "run_as": { "uid": 1, "gid": 1 } });
+        serde_json::from_value(c).unwrap()
+    }
+
+    struct Fixture {
+        _d: tempfile::TempDir,
+        root: PathBuf,
+        p: ProcParticipant,
+    }
+
+    fn fixture() -> Fixture {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("site");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = ProcParticipant::new(ParticipantId::new("proc:build"), config(&root), d.path()).unwrap();
+        Fixture { _d: d, root, p }
+    }
+
+    fn ctx(t: u128) -> TxCtx {
+        TxCtx { txid: TxId(t), data_dir: PathBuf::new(), deadline: None, outputs: Default::default() }
+    }
+
+    /// Leave `txid` as `stage` would: an upper holding `files` and the
+    /// process's exit code, journaled in `state`.
+    fn staged(f: &Fixture, t: u128, state: LocalState, exit_code: i32, files: &[&str]) {
+        let stage = stage_root_for(&f.root).join(TxId(t).to_string()).join("build");
+        let upper = stage.join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+        for name in files {
+            std::fs::write(upper.join(name), *name).unwrap();
+        }
+        let l = Local { stages: vec![(f.root.clone(), stage, upper)], ops: vec![], exit_code: Some(exit_code) };
+        f.p.journal.set(TxId(t), state, &l).unwrap();
+    }
+
+    /// Rewrite `txid`'s journal state, keeping its data.
+    fn restate(f: &Fixture, t: u128, state: LocalState) {
+        let (_, l) = f.p.load(TxId(t)).unwrap().unwrap();
+        f.p.journal.set(TxId(t), state, &l).unwrap();
+    }
+
+    #[test]
+    fn config_defaults_and_adapter_basics() {
+        let c = config(Path::new("/srv"));
+        assert_eq!((c.timeout_secs, c.landlock, c.seccomp, c.private_tmp), (600, true, true, true));
+        let d = tempfile::tempdir().unwrap();
+        let spec = |config| ParticipantSpec { id: ParticipantId::new("proc:b"), kind: "proc".into(), config };
+        let p = ProcParticipant::factory(&spec(serde_json::to_value(&c).unwrap()), d.path()).unwrap();
+        assert_eq!(p.id().as_str(), "proc:b");
+        assert!(p.capabilities().one_phase && p.capabilities().atomic);
+        assert!(ProcParticipant::factory(&spec(serde_json::json!({})), d.path()).is_err());
+        let none = ProcConfig { mounts: vec![], ..c.clone() };
+        assert!(ProcParticipant::new(ParticipantId::new("proc:b"), none, d.path()).err().unwrap().to_string().contains("no mounts"));
+        // The journal cannot be created under a file.
+        std::fs::write(d.path().join("file"), "").unwrap();
+        assert!(matches!(ProcParticipant::new(ParticipantId::new("proc:b"), c, &d.path().join("file")), Err(PartError::Fatal(_))));
+        assert_eq!(ProcParticipant::upper_dir(Path::new("/srv/site"), TxId(1), "s"), Path::new("/srv/.txp-stage/site").join(TxId(1).to_string()).join("s/upper"));
+    }
+
+    #[tokio::test]
+    async fn prepare_votes_from_what_the_process_left() {
+        let f = fixture();
+        assert_eq!(f.p.prepare(&ctx(1)).await.unwrap(), Vote::ReadOnly, "never staged");
+        staged(&f, 2, LocalState::Staged, 1, &["out"]);
+        assert!(matches!(f.p.prepare(&ctx(2)).await, Err(PartError::VoteNo(_))), "failed process");
+        staged(&f, 3, LocalState::Staged, 0, &[]);
+        assert_eq!(f.p.prepare(&ctx(3)).await.unwrap(), Vote::ReadOnly, "wrote nothing");
+        assert!(f.p.load(TxId(3)).unwrap().is_none());
+        staged(&f, 4, LocalState::Staged, 0, &["out"]);
+        assert_eq!(f.p.prepare(&ctx(4)).await.unwrap(), Vote::Prepared);
+        assert_eq!(f.p.prepare(&ctx(4)).await.unwrap(), Vote::Prepared, "idempotent");
+        restate(&f, 4, LocalState::Committed);
+        assert!(matches!(f.p.prepare(&ctx(4)).await, Err(PartError::Fatal(_))));
+        assert_eq!(f.p.recover().await.unwrap(), vec![(TxId(2), LocalState::Staged), (TxId(4), LocalState::Committed)]);
+    }
+
+    #[tokio::test]
+    async fn commit_and_abort_are_total() {
+        let f = fixture();
+        f.p.commit(TxId(1)).await.unwrap();
+        staged(&f, 2, LocalState::Aborted, 0, &[]);
+        f.p.commit(TxId(2)).await.unwrap();
+        staged(&f, 3, LocalState::Staged, 0, &["a"]);
+        assert!(f.p.commit(TxId(3)).await.unwrap_err().to_string().contains("commit before prepare"));
+        f.p.prepare(&ctx(3)).await.unwrap();
+        f.p.commit(TxId(3)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(f.root.join("a")).unwrap(), "a");
+
+        assert_eq!(f.p.abort(TxId(9)).await.unwrap(), AbortOutcome::Discarded);
+        staged(&f, 4, LocalState::Staged, 0, &["b"]);
+        assert_eq!(f.p.abort(TxId(4)).await.unwrap(), AbortOutcome::Discarded);
+        assert!(!f.root.join("b").exists());
+        // A local one-phase commit is finished, not undone.
+        staged(&f, 5, LocalState::Staged, 0, &["c"]);
+        f.p.prepare(&ctx(5)).await.unwrap();
+        restate(&f, 5, LocalState::Committed);
+        assert_eq!(f.p.abort(TxId(5)).await.unwrap(), AbortOutcome::AlreadyCommitted);
+        assert!(f.root.join("c").exists());
+    }
+
+    #[tokio::test]
+    async fn a_publish_that_cannot_happen_is_retried_not_dropped() {
+        let f = fixture();
+        staged(&f, 7, LocalState::Staged, 0, &["z"]);
+        f.p.prepare(&ctx(7)).await.unwrap();
+        let (_, l) = f.p.load(TxId(7)).unwrap().unwrap();
+        std::fs::remove_file(l.stages[0].2.join("z")).unwrap();
+        let e = f.p.commit(TxId(7)).await.unwrap_err();
+        assert!(matches!(&e, PartError::Transient(m) if m.starts_with("publish: ")), "{e}");
+    }
+
+    #[tokio::test]
+    async fn one_phase_commit_from_every_local_state() {
+        let f = fixture();
+        assert_eq!(f.p.commit_one_phase(&ctx(1)).await.unwrap(), Outcome::Committed);
+        staged(&f, 2, LocalState::Staged, 3, &["x"]);
+        assert_eq!(f.p.commit_one_phase(&ctx(2)).await.unwrap(), Outcome::Aborted("process failed".into()));
+        staged(&f, 3, LocalState::Staged, 0, &[]);
+        assert_eq!(f.p.commit_one_phase(&ctx(3)).await.unwrap(), Outcome::Committed);
+        staged(&f, 4, LocalState::Staged, 0, &["d"]);
+        assert_eq!(f.p.commit_one_phase(&ctx(4)).await.unwrap(), Outcome::Committed);
+        assert!(f.root.join("d").exists());
+        staged(&f, 5, LocalState::Staged, 0, &["e"]);
+        f.p.prepare(&ctx(5)).await.unwrap();
+        assert_eq!(f.p.commit_one_phase(&ctx(5)).await.unwrap(), Outcome::Committed);
+        assert!(f.root.join("e").exists());
+        staged(&f, 6, LocalState::Aborted, 0, &[]);
+        assert_eq!(f.p.commit_one_phase(&ctx(6)).await.unwrap(), Outcome::Aborted("locally aborted".into()));
     }
 }

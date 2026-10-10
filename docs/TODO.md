@@ -22,9 +22,9 @@ correctness claims. Check items off as they land.
 - [x] Audit trail: `LogRecord::Begin` now carries an `Option<Submitter>`
       (uid/gid/pid), `#[serde(default)]` so old logs still replay.
       (txp-core/src/record.rs)
-- [x] seccomp-bpf denylist for sandboxed steps: a hand-built cBPF filter
-      (`libc::SYS_*`, portable across x86_64/aarch64) installed in the
-      grandchild after `no_new_privs`, fail-closed. Verified active on the
+- [x] seccomp-bpf denylist for sandboxed steps: a `seccompiler` filter
+      (`libc::SYS_*`, portable across x86_64/aarch64/riscv64) installed in the
+      confined init process after `no_new_privs`, fail-closed. Verified active on the
       step process (mode 2) by a root test. (txp-proc/src/seccomp.rs)
 
 Follow-ups deferred out of Tier 0: supplementary-group checks for a pinned

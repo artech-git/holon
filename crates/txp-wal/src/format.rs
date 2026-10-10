@@ -121,3 +121,51 @@ pub fn decode_record(buf: &[u8]) -> Frame {
         Err(e) => Frame::Bad(format!("payload decode: {e}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> SegmentHeader {
+        SegmentHeader { version: 1, segment_id: 7, base_lsn: Lsn(42), created_unix: 1_700_000_000 }
+    }
+
+    #[test]
+    fn header_roundtrip_and_rejections() {
+        let b = header().encode();
+        assert_eq!(SegmentHeader::decode(&b), Some(header()));
+        assert_eq!(SegmentHeader::decode(&b[..HEADER_LEN - 1]), None, "short");
+        let mut bad_magic = b;
+        bad_magic[0] ^= 1;
+        assert_eq!(SegmentHeader::decode(&bad_magic), None, "magic");
+        let mut bad_crc = b;
+        bad_crc[20] ^= 1;
+        assert_eq!(SegmentHeader::decode(&bad_crc), None, "crc");
+    }
+
+    #[test]
+    fn every_kind_of_bad_frame_is_explained() {
+        let rec = LogRecord::Done { txid: txp_core::TxId(1) };
+        let good = encode_record(Lsn(3), &rec);
+        assert_eq!(decode_record(&good), Frame::Ok { lsn: Lsn(3), rec, consumed: good.len() });
+        assert_eq!(decode_record(&[]), Frame::End);
+        assert_eq!(decode_record(&[0; 100]), Frame::End);
+        assert_eq!(decode_record(&[1, 0]), Frame::Bad("short tail".into()));
+        let mut zero_len_garbage = vec![0u8; 8];
+        zero_len_garbage[6] = 9;
+        assert_eq!(decode_record(&zero_len_garbage), Frame::Bad("zero length".into()));
+        assert_eq!(decode_record(&5u32.to_le_bytes()), Frame::Bad("implausible length 5".into()));
+        assert_eq!(decode_record(&good[..good.len() - 1]), Frame::Bad("truncated record".into()));
+        let mut flipped = good.clone();
+        *flipped.last_mut().unwrap() ^= 1;
+        assert_eq!(decode_record(&flipped), Frame::Bad("crc mismatch".into()));
+
+        // A frame whose checksum is right but whose payload is not a record.
+        let mut body = 3u64.to_le_bytes().to_vec();
+        body.extend_from_slice(b"not json");
+        let mut frame = ((4 + body.len()) as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
+        frame.extend_from_slice(&body);
+        assert!(matches!(decode_record(&frame), Frame::Bad(r) if r.starts_with("payload decode:")));
+    }
+}

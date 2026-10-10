@@ -1,4 +1,4 @@
-//! Root-only integration tests. Run via `scripts/test-proc.sh` (builds as the
+//! Root-only integration tests. Run via `scripts/test-root.sh` (builds as the
 //! normal user, executes the test binary with sudo).
 
 use std::path::Path;
@@ -8,7 +8,7 @@ use txp_participant::{Participant, StepSpec, TxCtx, Vote};
 use txp_proc::{MountSpec, ProcConfig, ProcParticipant, RunAs};
 
 fn is_root() -> bool {
-    (unsafe { libc::geteuid() }) == 0
+    nix::unistd::geteuid().is_root()
 }
 
 fn tmp() -> tempfile::TempDir {
@@ -33,6 +33,85 @@ fn cfg(step: &str, root: &Path, argv: &[&str], extra_lowers: Vec<std::path::Path
 
 fn ctx(t: u128, d: &Path) -> TxCtx {
     TxCtx { txid: TxId(t), data_dir: d.to_path_buf(), deadline: None, outputs: Default::default() }
+}
+
+fn step(id: &str) -> StepSpec {
+    StepSpec { id: id.into(), kind: "process".into(), config: serde_json::Value::Null }
+}
+
+/// A root under a fresh temp dir that the unprivileged step may write.
+fn writable_root() -> (tempfile::TempDir, std::path::PathBuf) {
+    let d = tmp();
+    let root = d.path().join("r");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(d.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    (d, root)
+}
+
+#[tokio::test]
+async fn the_step_sees_its_environment_and_the_transaction_deadline() {
+    let (d, root) = writable_root();
+    let mut c = cfg("env", &root, &["/bin/sh", "-c", "echo $GREETING $TXP_STEP; sleep 3"], vec![]);
+    c.env.insert("GREETING".into(), "hi-$txid".into());
+    let p = ProcParticipant::new(ParticipantId::new("proc:env"), c, d.path()).unwrap();
+    let mut x = ctx(7, d.path());
+    x.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+    let r = p.stage(&x, &step("env")).await;
+    if !is_root() {
+        // A normal user cannot even create the step's cgroup.
+        assert!(r.unwrap_err().to_string().contains("cgroup:"));
+        return;
+    }
+    // The transaction deadline (1s) cuts the step short of its own 20s.
+    let e = r.unwrap_err();
+    assert!(e.to_string().contains("timed out after"), "{e}");
+    let mut c = cfg("env2", &root, &["/bin/sh", "-c", "echo $GREETING $TXP_STEP"], vec![]);
+    c.env.insert("GREETING".into(), "hi-$txid".into());
+    let p = ProcParticipant::new(ParticipantId::new("proc:env2"), c, d.path()).unwrap();
+    let rep = p.stage(&ctx(8, d.path()), &step("env2")).await.unwrap();
+    assert_eq!(rep.outputs["stdout"], format!("hi-{} env2\n", TxId(8)));
+    // Wrote nothing: the one-phase path commits without publishing.
+    assert_eq!(p.commit_one_phase(&ctx(8, d.path())).await.unwrap(), txp_participant::Outcome::Committed);
+    assert!(p.stage(&ctx(8, d.path()), &step("env2")).await.is_ok(), "journal is gone after commit");
+}
+
+#[tokio::test]
+async fn a_sandbox_that_cannot_start_is_fatal_and_staging_twice_is_refused() {
+    if !is_root() {
+        let spec = txp_proc::SandboxSpec {
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            mounts: vec![],
+            uid: 1,
+            gid: 1,
+            timeout: std::time::Duration::from_secs(1),
+            cgroup: txp_proc::cgroup::Cgroup { path: "/nonexistent".into() },
+            landlock: false,
+            seccomp: false,
+            private_tmp: false,
+            output_limit: 0,
+        };
+        let e = txp_proc::sandbox::run(spec).await.unwrap_err();
+        assert!(e.to_string().contains("must run as root"), "{e}");
+        return;
+    }
+    let (d, root) = writable_root();
+    let mut c = cfg("nocwd", &root, &["/bin/true"], vec![]);
+    c.cwd = Some(root.join("missing"));
+    let p = ProcParticipant::new(ParticipantId::new("proc:nocwd"), c, d.path()).unwrap();
+    let e = p.stage(&ctx(9, d.path()), &step("nocwd")).await.unwrap_err();
+    assert!(matches!(&e, txp_participant::PartError::Fatal(m) if m.starts_with("sandbox: chdir")), "{e}");
+    // The journal still holds the attempt, so staging again is refused.
+    let e = p.stage(&ctx(9, d.path()), &step("nocwd")).await.unwrap_err();
+    assert!(e.to_string().contains("already staged"), "{e}");
+    p.abort(TxId(9)).await.unwrap();
+    // A root that is not a directory cannot be staged.
+    let file = d.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    let p = ProcParticipant::new(ParticipantId::new("proc:file"), cfg("file", &file, &["/bin/true"], vec![]), d.path()).unwrap();
+    assert!(matches!(p.stage(&ctx(10, d.path()), &step("file")).await, Err(txp_participant::PartError::VoteNo(_))));
 }
 
 #[tokio::test]

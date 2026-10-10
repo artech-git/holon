@@ -19,7 +19,11 @@ tokio = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-libc = { workspace = true }
+nix = { workspace = true, features = ["signal", "user"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

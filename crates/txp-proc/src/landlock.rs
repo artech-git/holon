@@ -1,142 +1,115 @@
-//! Minimal raw Landlock binding (no crate dependency, so the pre-exec child
-//! only calls async-signal-safe syscalls).
+//! Landlock filesystem confinement, via the `landlock` crate.
+//!
+//! The sandbox handles every filesystem right up to [`TARGET_ABI`]. On an
+//! older kernel the crate drops the rights it does not know (best effort),
+//! but [`restrict_self`] fails closed when the kernel has no Landlock at all.
 
-use std::ffi::CStr;
+use landlock::{
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    RulesetCreatedAttr,
+};
 use std::io;
+use std::path::Path;
 
-const SYS_CREATE_RULESET: libc::c_long = 444;
-const SYS_ADD_RULE: libc::c_long = 445;
-const SYS_RESTRICT_SELF: libc::c_long = 446;
-const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
-const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+/// Newest Landlock ABI whose filesystem rights the sandbox handles
+/// (V5 adds `IoctlDev`).
+pub const TARGET_ABI: ABI = ABI::V5;
 
-/// Execute a file.
-pub const FS_EXECUTE: u64 = 1 << 0;
-/// Open a file for writing.
-pub const FS_WRITE_FILE: u64 = 1 << 1;
-/// Open a file for reading.
-pub const FS_READ_FILE: u64 = 1 << 2;
-/// List a directory.
-pub const FS_READ_DIR: u64 = 1 << 3;
-/// Remove an empty directory or rename one away.
-pub const FS_REMOVE_DIR: u64 = 1 << 4;
-/// Unlink a file or rename one away.
-pub const FS_REMOVE_FILE: u64 = 1 << 5;
-/// Create a character device.
-pub const FS_MAKE_CHAR: u64 = 1 << 6;
-/// Create a directory.
-pub const FS_MAKE_DIR: u64 = 1 << 7;
-/// Create a regular file.
-pub const FS_MAKE_REG: u64 = 1 << 8;
-/// Create a Unix socket.
-pub const FS_MAKE_SOCK: u64 = 1 << 9;
-/// Create a named pipe.
-pub const FS_MAKE_FIFO: u64 = 1 << 10;
-/// Create a block device.
-pub const FS_MAKE_BLOCK: u64 = 1 << 11;
-/// Create a symbolic link.
-pub const FS_MAKE_SYM: u64 = 1 << 12;
-/// Link or rename across directories (ABI 2).
-pub const FS_REFER: u64 = 1 << 13; // ABI 2
-/// Truncate a file (ABI 3).
-pub const FS_TRUNCATE: u64 = 1 << 14; // ABI 3
-/// Issue `ioctl` on a device file (ABI 5).
-pub const FS_IOCTL_DEV: u64 = 1 << 15; // ABI 5
-
-#[repr(C)]
-struct RulesetAttr {
-    handled_access_fs: u64,
-}
-
-#[repr(C, packed)]
-struct PathBeneathAttr {
-    allowed_access: u64,
-    parent_fd: i32,
-}
-
-/// Landlock ABI version supported by the running kernel, or <= 0 if absent.
+/// Landlock ABI supported by the running kernel, capped at [`TARGET_ABI`];
+/// `0` when Landlock is absent or disabled.
 pub fn abi_version() -> i32 {
-    let r = unsafe { libc::syscall(SYS_CREATE_RULESET, std::ptr::null::<u8>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION) };
-    r as i32
+    // The crate keeps the kernel's version private, so ask for each ABI's
+    // rights as a hard requirement, newest first. V4 added only network
+    // rights, so those are part of the probe too.
+    let supports = |abi: ABI| {
+        let r = Ruleset::default().set_compatibility(CompatLevel::HardRequirement).handle_access(AccessFs::from_all(abi));
+        let r = if abi >= ABI::V4 { r.and_then(|r| r.handle_access(AccessNet::from_all(abi))) } else { r };
+        r.is_ok()
+    };
+    [ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1].into_iter().find(|&abi| supports(abi)).map_or(0, |abi| abi as i32)
 }
 
-/// All filesystem access rights the given ABI knows about.
-pub fn fs_rights_for_abi(abi: i32) -> u64 {
-    let mut r = FS_EXECUTE
-        | FS_WRITE_FILE
-        | FS_READ_FILE
-        | FS_READ_DIR
-        | FS_REMOVE_DIR
-        | FS_REMOVE_FILE
-        | FS_MAKE_CHAR
-        | FS_MAKE_DIR
-        | FS_MAKE_REG
-        | FS_MAKE_SOCK
-        | FS_MAKE_FIFO
-        | FS_MAKE_BLOCK
-        | FS_MAKE_SYM;
-    if abi >= 2 {
-        r |= FS_REFER;
-    }
-    if abi >= 3 {
-        r |= FS_TRUNCATE;
-    }
-    if abi >= 5 {
-        r |= FS_IOCTL_DEV;
-    }
-    r
+/// Every filesystem right the sandbox handles.
+pub fn full_rights() -> BitFlags<AccessFs> {
+    AccessFs::from_all(TARGET_ABI)
 }
 
 /// Rights that allow reading and executing but no modification.
-pub fn read_only_rights() -> u64 {
-    FS_EXECUTE | FS_READ_FILE | FS_READ_DIR
+pub fn read_only_rights() -> BitFlags<AccessFs> {
+    AccessFs::from_read(TARGET_ABI)
 }
 
-/// A rule: `path` (NUL-terminated) gets `allowed` rights.
+/// Open and write existing files only (for `/dev`).
+pub fn read_write_file_rights() -> BitFlags<AccessFs> {
+    AccessFs::ReadFile | AccessFs::WriteFile
+}
+
+/// A rule: everything beneath `path` gets `allowed` rights.
 pub struct Rule<'a> {
     /// Directory (or file) the rule applies beneath.
-    pub path: &'a CStr,
-    /// Bitmask of `FS_*` rights granted under `path`.
-    pub allowed: u64,
+    pub path: &'a Path,
+    /// Rights granted under `path`.
+    pub allowed: BitFlags<AccessFs>,
 }
 
-/// Apply the ruleset to the calling thread. Async-signal-safe: only
-/// `open`, `syscall`, `close`, `prctl`.
-///
-/// # Safety
-/// Intended to be called in a forked child before `exec`; the paths must be
-/// valid NUL-terminated strings for the lifetime of the call.
-pub unsafe fn restrict_self(abi: i32, rules: &[Rule<'_>]) -> io::Result<()> {
-    let handled = fs_rights_for_abi(abi);
-    let attr = RulesetAttr { handled_access_fs: handled };
-    let fd = unsafe { libc::syscall(SYS_CREATE_RULESET, &attr as *const _, std::mem::size_of::<RulesetAttr>(), 0u32) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = fd as i32;
+/// Apply the ruleset to the calling process; this also sets `no_new_privs`
+/// (without which an unprivileged caller's restriction fails). The ABI V1
+/// rights are a hard requirement, so a kernel without Landlock is an error
+/// rather than a silently unenforced ruleset; newer rights are best effort.
+pub fn restrict_self(rules: &[Rule<'_>]) -> io::Result<()> {
+    restrict_self_requiring(ABI::V1, rules)
+}
+
+/// [`restrict_self`], with the rights of `minimum` as the hard requirement.
+fn restrict_self_requiring(minimum: ABI, rules: &[Rule<'_>]) -> io::Result<()> {
+    let unavailable = |e| io::Error::other(format!("Landlock {minimum:?} is not available on this kernel ({e}); refusing to run unconfined"));
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(minimum))
+        .map_err(unavailable)?
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(full_rights())
+        .and_then(|r| r.create())
+        .map_err(io::Error::other)?;
     for r in rules {
-        let pfd = unsafe { libc::open(r.path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-        if pfd < 0 {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
-        let pa = PathBeneathAttr { allowed_access: r.allowed & handled, parent_fd: pfd };
-        let rc = unsafe { libc::syscall(SYS_ADD_RULE, fd, LANDLOCK_RULE_PATH_BENEATH, &pa as *const _, 0u32) };
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(pfd) };
-        if rc != 0 {
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
+        let fd = PathFd::new(r.path).map_err(|e| io::Error::other(format!("{}: {e}", r.path.display())))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(fd, r.allowed)).map_err(io::Error::other)?;
     }
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(e);
+    ruleset.restrict_self().map(drop).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kernel_without_the_required_landlock_is_refused() {
+        // A successful restriction would confine this very test binary, so
+        // the attempt runs in a child process.
+        if std::env::var_os("TXP_LANDLOCK_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "landlock::tests::a_kernel_without_the_required_landlock_is_refused", "--nocapture"])
+                .env("TXP_LANDLOCK_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        // No kernel today has ABI 9; one that does would simply confine the child.
+        let r = restrict_self_requiring(ABI::V9, &[]);
+        let has_v9 = Ruleset::default().set_compatibility(CompatLevel::HardRequirement).handle_access(AccessFs::from_all(ABI::V9)).is_ok();
+        assert!(has_v9 || r.is_err_and(|e| e.to_string().starts_with("Landlock V9 is not available on this kernel")));
     }
-    let rc = unsafe { libc::syscall(SYS_RESTRICT_SELF, fd, 0u32) };
-    let e = io::Error::last_os_error();
-    unsafe { libc::close(fd) };
-    if rc != 0 { Err(e) } else { Ok(()) }
+
+    #[test]
+    fn a_rule_for_a_missing_path_fails_before_anything_is_restricted() {
+        let r = restrict_self(&[Rule { path: Path::new("/nonexistent"), allowed: read_only_rights() }]);
+        assert!(r.unwrap_err().to_string().starts_with("/nonexistent: "));
+    }
+
+    #[test]
+    fn abi_and_rights() {
+        assert!((0..=5).contains(&abi_version()));
+        assert!(full_rights().contains(read_only_rights() | read_write_file_rights()));
+    }
 }

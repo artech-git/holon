@@ -104,6 +104,16 @@ mod tests {
     }
 
     #[test]
+    fn token_carries_its_lsn_and_both_abort_paths_keep_the_payload() {
+        let proof = DurableCommit::mint(TxId(7), Lsn(3));
+        assert_eq!((proof.txid(), proof.lsn()), (TxId(7), Lsn(3)));
+        let a = Txn::<Started, &str>::new(TxId(1), "ctx").abort();
+        assert_eq!((a.id(), a.payload), (TxId(1), "ctx"));
+        let b = Txn::<Started, &str>::new(TxId(2), "ctx").begin_prepare().decide_abort();
+        assert_eq!((b.id(), b.payload), (TxId(2), "ctx"));
+    }
+
+    #[test]
     #[should_panic]
     fn wrong_token_panics() {
         let t = Txn::<Started, ()>::new(TxId(7), ()).begin_prepare();

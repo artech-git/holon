@@ -66,11 +66,8 @@ async fn main() -> anyhow::Result<()> {
 
     let caps = txp_proc::host_capabilities();
     tracing::info!(?caps, "host self-test");
-    if !caps.is_root {
-        tracing::warn!("not running as root: process steps will be refused (fs steps still work)");
-    }
-    if caps.landlock_abi < 1 {
-        tracing::warn!("Landlock unavailable: process steps will be refused (fail closed)");
+    for w in caps.warnings() {
+        tracing::warn!("{w}");
     }
 
     let mut ecfg = EngineConfig::new(&args.data_dir);
@@ -122,15 +119,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(stream: tokio::net::UnixStream, engine: Arc<Engine>, shutdown: tokio::sync::mpsc::Sender<()>) -> anyhow::Result<()> {
-    // Authenticate the peer before reading anything it sends.
-    let who = match stream.peer_cred() {
-        Ok(c) => Submitter { uid: c.uid(), gid: c.gid(), pid: c.pid() },
-        Err(e) => {
-            let (_, mut w) = stream.into_split();
-            write(&mut w, Response::err(format!("cannot read peer credentials: {e}"))).await?;
-            return Ok(());
-        }
-    };
+    // Authenticate the peer before reading anything it sends. (A connected
+    // Unix socket always has peer credentials; without them, hang up.)
+    let c = stream.peer_cred().context("peer credentials")?;
+    let who = Submitter { uid: c.uid(), gid: c.gid(), pid: c.pid() };
     tracing::debug!(uid = who.uid, gid = who.gid, pid = ?who.pid, "client connected");
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();

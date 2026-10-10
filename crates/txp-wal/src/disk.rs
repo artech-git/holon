@@ -83,19 +83,16 @@ impl SegmentHandle for RealHandle {
         Ok(self.0.metadata()?.len())
     }
     fn preallocate(&mut self, len: u64) -> io::Result<()> {
-        use std::os::unix::io::AsRawFd;
+        use nix::errno::Errno;
+        use nix::fcntl::{FallocateFlags, fallocate};
         // fallocate with mode 0 allocates *and* extends the size with zeros,
         // so steady-state appends change no metadata and fdatasync suffices.
-        let r = unsafe { libc::fallocate(self.0.as_raw_fd(), 0, 0, len as libc::off_t) };
-        if r != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
-                // Filesystem without fallocate: fall back to extending.
-                return self.0.set_len(len);
-            }
-            return Err(e);
+        match fallocate(&self.0, FallocateFlags::empty(), 0, len as nix::libc::off_t) {
+            Ok(()) => Ok(()),
+            // Filesystem without fallocate: fall back to extending.
+            Err(Errno::EOPNOTSUPP) => self.0.set_len(len),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
     fn truncate(&mut self, len: u64) -> io::Result<()> {
         self.0.set_len(len)
@@ -145,5 +142,54 @@ impl Disk for RealDisk {
     }
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_segment_handle_reads_writes_syncs_and_resizes() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("seg");
+        let mut h = RealDisk.create(&p).unwrap();
+        assert_eq!(RealDisk.create(&p).err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
+        h.preallocate(4096).unwrap();
+        assert_eq!(h.len().unwrap(), 4096);
+        h.write_at(10, b"hello").unwrap();
+        h.datasync().unwrap();
+        h.fsync().unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(h.read_at(10, &mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+        // A read running past the end returns what is there.
+        let mut tail = [0u8; 16];
+        assert_eq!(h.read_at(4090, &mut tail).unwrap(), 6);
+        h.truncate(12).unwrap();
+        assert_eq!(h.len().unwrap(), 12);
+        // fallocate refuses a length that does not fit in off_t.
+        assert_eq!(h.preallocate(u64::MAX).unwrap_err().raw_os_error(), Some(nix::libc::EINVAL));
+        let mut again = RealDisk.open(&p).unwrap();
+        assert_eq!(again.len().unwrap(), 12);
+        assert!(RealDisk.open(&d.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn real_disk_directory_operations() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("a/b");
+        RealDisk.create_dir_all(&dir).unwrap();
+        RealDisk.write_atomic(&dir.join("snap.json"), b"{}").unwrap();
+        assert_eq!(RealDisk.read_all(&dir.join("snap.json")).unwrap(), b"{}");
+        RealDisk.create(&dir.join("x")).unwrap();
+        RealDisk.rename(&dir.join("x"), &dir.join("y")).unwrap();
+        assert!(!RealDisk.exists(&dir.join("x")));
+        assert!(RealDisk.exists(&dir.join("y")));
+        assert_eq!(RealDisk.list(&dir).unwrap(), vec![dir.join("snap.json"), dir.join("y")]);
+        RealDisk.remove(&dir.join("y")).unwrap();
+        RealDisk.fsync_dir(&dir).unwrap();
+        assert_eq!(RealDisk.list(&dir).unwrap(), vec![dir.join("snap.json")]);
+        assert!(RealDisk.list(&d.path().join("missing")).is_err());
     }
 }

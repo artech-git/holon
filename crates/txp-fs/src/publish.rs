@@ -1,7 +1,9 @@
 //! Idempotent redo publish.
 
+use nix::errno::Errno;
+use nix::fcntl::{AT_FDCWD, AtFlags, RenameFlags, renameat2};
+use nix::unistd::{Gid, Uid, fchownat};
 use serde::{Deserialize, Serialize};
-use std::ffi::CString;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -70,13 +72,11 @@ impl DirAttrs {
 
 fn apply_attrs(target: &Path, a: &DirAttrs) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let c = CString::new(target.as_os_str().as_encoded_bytes()).map_err(|_| io::Error::other("nul in path"))?;
-    if unsafe { libc::lchown(c.as_ptr(), a.uid, a.gid) } != 0 {
-        let e = io::Error::last_os_error();
+    let (uid, gid) = (Some(Uid::from_raw(a.uid)), Some(Gid::from_raw(a.gid)));
+    match fchownat(AT_FDCWD, target, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW) {
         // Unprivileged daemons cannot chown; keep going with the mode.
-        if e.raw_os_error() != Some(libc::EPERM) {
-            return Err(e);
-        }
+        Ok(()) | Err(Errno::EPERM) => {}
+        Err(e) => return Err(e.into()),
     }
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(a.mode))
 }
@@ -93,13 +93,7 @@ fn fsync_parent(p: &Path) -> io::Result<()> {
 }
 
 fn rename_exchange(a: &Path, b: &Path) -> io::Result<()> {
-    let ca = CString::new(a.as_os_str().as_encoded_bytes()).map_err(|_| io::Error::other("nul in path"))?;
-    let cb = CString::new(b.as_os_str().as_encoded_bytes()).map_err(|_| io::Error::other("nul in path"))?;
-    const RENAME_EXCHANGE: libc::c_uint = 2;
-    let r = unsafe {
-        libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, ca.as_ptr(), libc::AT_FDCWD, cb.as_ptr(), RENAME_EXCHANGE)
-    };
-    if r != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    renameat2(AT_FDCWD, a, AT_FDCWD, b, RenameFlags::RENAME_EXCHANGE).map_err(io::Error::from)
 }
 
 fn remove_any(p: &Path) -> io::Result<()> {
@@ -265,5 +259,85 @@ mod tests {
         std::fs::create_dir_all(&sd).unwrap();
         apply(&RedoOp::SwapDir { staged: sd.clone(), target: td.clone(), ino: ino_of(&sd).unwrap() }).unwrap();
         assert!(td.is_dir());
+    }
+
+    #[test]
+    fn swap_dir_onto_a_missing_target_or_a_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (sd, missing) = (d.path().join("sd"), d.path().join("new/dir"));
+        std::fs::create_dir(&sd).unwrap();
+        apply(&RedoOp::SwapDir { staged: sd.clone(), target: missing.clone(), ino: ino_of(&sd).unwrap() }).unwrap();
+        assert!(missing.is_dir() && !sd.exists());
+        let (sd2, file) = (d.path().join("sd2"), d.path().join("file"));
+        std::fs::create_dir(&sd2).unwrap();
+        std::fs::write(&file, "x").unwrap();
+        apply(&RedoOp::SwapDir { staged: sd2.clone(), target: file.clone(), ino: ino_of(&sd2).unwrap() }).unwrap();
+        assert!(file.is_dir());
+    }
+
+    #[test]
+    fn replays_with_the_staged_copy_gone_are_anomalies() {
+        let d = tempfile::tempdir().unwrap();
+        let gone = d.path().join("gone");
+        let target = d.path().join("t");
+        std::fs::write(&target, "someone else's").unwrap();
+        let e = apply(&RedoOp::PublishFile { staged: gone.clone(), target: target.clone(), ino: 1 }).unwrap_err();
+        assert!(e.to_string().starts_with("redo anomaly: staged"), "{e}");
+        let e = apply(&RedoOp::SwapDir { staged: gone, target, ino: 1 }).unwrap_err();
+        assert!(e.to_string().starts_with("redo anomaly: staged dir"), "{e}");
+    }
+
+    #[test]
+    fn paths_through_a_file_fail_and_empty_paths_have_no_parent() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let below = file.join("x");
+        let e = execute_redo(&[RedoOp::Delete { target: below.clone() }]).unwrap_err();
+        assert!(e.to_string().starts_with("Delete {"), "{e}");
+        let sd = d.path().join("sd");
+        std::fs::create_dir(&sd).unwrap();
+        let ino = ino_of(&sd).unwrap();
+        assert!(apply(&RedoOp::SwapDir { staged: sd.clone(), target: below, ino }).is_err());
+        let too_long = d.path().join("n".repeat(300));
+        let e = apply(&RedoOp::SwapDir { staged: sd.clone(), target: too_long, ino }).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(nix::libc::ENAMETOOLONG));
+        // A degenerate empty target: nothing to delete, nowhere to publish.
+        apply(&RedoOp::Delete { target: PathBuf::new() }).unwrap();
+        let staged = d.path().join("staged");
+        std::fs::write(&staged, "x").unwrap();
+        let ino = ino_of(&staged).unwrap();
+        assert!(apply(&RedoOp::PublishFile { staged, target: PathBuf::new(), ino }).is_err());
+        assert!(apply(&RedoOp::SwapDir { staged: sd, target: PathBuf::new(), ino }).is_err());
+    }
+
+    #[test]
+    fn mkdir_replaces_a_file_and_applies_attributes() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("t");
+        std::fs::write(&t, "x").unwrap();
+        apply(&RedoOp::Mkdir { target: t.clone(), attrs: None }).unwrap();
+        assert!(t.is_dir());
+        let mine = DirAttrs::of(&t).unwrap();
+        // Someone else's ownership: an unprivileged daemon keeps the mode only.
+        let attrs = DirAttrs { uid: mine.uid + 1, gid: mine.gid, mode: 0o750 };
+        apply(&RedoOp::Mkdir { target: t.clone(), attrs: Some(attrs) }).unwrap();
+        assert_eq!(std::fs::metadata(&t).unwrap().permissions().mode() & 0o7777, 0o750);
+    }
+
+    #[test]
+    fn copy_tree_keeps_files_dirs_and_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let from = d.path().join("from");
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        std::fs::write(from.join("sub/f"), "data").unwrap();
+        std::os::unix::fs::symlink("sub/f", from.join("link")).unwrap();
+        let to = d.path().join("to");
+        copy_tree(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("sub/f")).unwrap(), "data");
+        assert_eq!(std::fs::read_link(to.join("link")).unwrap(), Path::new("sub/f"));
+        fsync_tree(&to).unwrap();
+        assert!(copy_tree(&d.path().join("missing"), &to).is_err());
     }
 }

@@ -193,6 +193,29 @@ mod tests {
     }
 
     #[test]
+    fn process_step_timeouts_are_whole_seconds_of_at_least_one() {
+        let policy = RunAsPolicy { default: RunAs { uid: 1, gid: 1 }, pin: None };
+        for (t, secs) in [("90s", 90), ("100ms", 1)] {
+            let m = Manifest::parse(&format!("{PROC}timeout = \"{t}\"\n")).unwrap();
+            let plan = Plan::build(&m, "txt", TxId(1), &policy).unwrap();
+            let spec = plan.participants.iter().find(|p| p.kind == "proc").unwrap();
+            assert_eq!(serde_json::from_value::<ProcConfig>(spec.config.clone()).unwrap().timeout_secs, secs, "{t}");
+        }
+    }
+
+    #[test]
+    fn process_steps_carry_their_environment_and_need_numeric_users() {
+        let policy = RunAsPolicy { default: RunAs { uid: 1, gid: 1 }, pin: None };
+        let m = Manifest::parse(&format!("{PROC}env = {{ GREETING = \"hi\" }}\n")).unwrap();
+        let plan = Plan::build(&m, "txt", TxId(1), &policy).unwrap();
+        let spec = plan.participants.iter().find(|p| p.kind == "proc").unwrap();
+        let cfg = serde_json::from_value::<ProcConfig>(spec.config.clone()).unwrap();
+        assert_eq!(cfg.env.get("GREETING").map(String::as_str), Some("hi"));
+        let e = Plan::build(&manifest(Some("nobody")), "txt", TxId(1), &policy).unwrap_err();
+        assert!(e.to_string().contains("user must be numeric uid[:gid], got \"nobody\""), "{e}");
+    }
+
+    #[test]
     fn root_submitter_may_choose_any_uid() {
         let policy = RunAsPolicy { default: RunAs { uid: 65534, gid: 65534 }, pin: None };
         let plan = Plan::build(&manifest(Some("0:0")), "txt", TxId(1), &policy).unwrap();

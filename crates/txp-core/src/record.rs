@@ -134,3 +134,44 @@ impl LogRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_kinds() -> Vec<LogRecord> {
+        let txid = TxId(5);
+        vec![
+            LogRecord::Begin { txid, name: "n".into(), manifest_digest: "d".into(), submitter: None, participants: vec![] },
+            LogRecord::Prepared { txid, votes: vec![(ParticipantId::new("fs:a"), "Prepared".into())] },
+            LogRecord::Commit { txid, participants: vec![ParticipantId::new("fs:a")] },
+            LogRecord::Abort { txid },
+            LogRecord::Done { txid },
+            LogRecord::ForceResolve { txid, decision: Decision::Abort, reason: "operator".into() },
+        ]
+    }
+
+    #[test]
+    fn kind_name_matches_serialized_tag_and_txid_is_shared() {
+        for rec in all_kinds() {
+            let v = serde_json::to_value(&rec).unwrap();
+            assert_eq!(v["kind"], rec.kind_name(), "{rec:?}");
+            assert_eq!(rec.txid(), TxId(5));
+            assert_eq!(serde_json::from_value::<LogRecord>(v).unwrap(), rec);
+        }
+    }
+
+    #[test]
+    fn only_commit_and_force_resolve_are_forced() {
+        let forced: Vec<&str> = all_kinds().iter().filter(|r| r.is_forced()).map(|r| r.kind_name()).collect();
+        assert_eq!(forced, vec!["commit", "force_resolve"]);
+    }
+
+    #[test]
+    fn begin_without_submitter_field_still_parses() {
+        let old = r#"{"kind":"begin","txid":"5","name":"n","manifest_digest":"d","participants":[]}"#;
+        assert!(matches!(serde_json::from_str::<LogRecord>(old).unwrap(), LogRecord::Begin { submitter: None, .. }));
+        let s: Submitter = serde_json::from_str(r#"{"uid":1,"gid":2}"#).unwrap();
+        assert_eq!(s, Submitter { uid: 1, gid: 2, pid: None });
+    }
+}

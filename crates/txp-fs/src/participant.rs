@@ -267,6 +267,107 @@ mod tests {
         assert!(!crate::stage_root_for(&root).join(TxId(2).to_string()).exists());
     }
 
+    fn step(kind: &str, config: serde_json::Value) -> StepSpec {
+        StepSpec { id: "s".into(), kind: kind.into(), config }
+    }
+
+    fn site(d: &Path) -> FsParticipant {
+        let root = d.join("site");
+        std::fs::create_dir_all(&root).unwrap();
+        FsParticipant::new(ParticipantId::new("fs:site"), FsConfig { root }, d).unwrap()
+    }
+
+    #[tokio::test]
+    async fn factory_identity_and_bad_configurations() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("r")).unwrap();
+        let spec = |config| ParticipantSpec { id: ParticipantId::new("fs:r"), kind: "fs".into(), config };
+        let p = FsParticipant::factory(&spec(serde_json::json!({"root": d.path().join("r")})), d.path()).unwrap();
+        assert_eq!(p.id().as_str(), "fs:r");
+        assert!(p.capabilities().one_phase && p.capabilities().read_only_capable);
+        assert!(FsParticipant::factory(&spec(serde_json::json!({})), d.path()).is_err());
+        let e = FsParticipant::new(ParticipantId::new("fs:x"), FsConfig { root: d.path().join("missing") }, d.path()).err().unwrap();
+        assert!(e.to_string().contains("is not a directory"), "{e}");
+        // The journal cannot be created under a file.
+        let bad = d.path().join("bad");
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::write(bad.join("participants"), "x").unwrap();
+        let e = FsParticipant::new(ParticipantId::new("fs:r"), FsConfig { root: d.path().join("r") }, &bad).err().unwrap();
+        assert!(matches!(e, PartError::Fatal(_)));
+    }
+
+    #[tokio::test]
+    async fn steps_with_bad_arguments_vote_no() {
+        let d = tempfile::tempdir().unwrap();
+        let p = site(d.path());
+        assert_eq!(p.root(), d.path().join("site"));
+        let c = ctx(TxId(1), d.path());
+        let cases = [
+            step("fs.put", serde_json::json!({"content": "x"})),
+            step("fs.put", serde_json::json!({"path": "../escape", "content": "x"})),
+            step("fs.put", serde_json::json!({"path": "/", "content": "x"})),
+            step("fs.put", serde_json::json!({"path": "f"})),
+            step("fs.put", serde_json::json!({"path": "f", "source": d.path().join("missing")})),
+            step("fs.replace_tree", serde_json::json!({"path": "t"})),
+            step("fs.replace_tree", serde_json::json!({"path": "t", "source": d.path().join("missing")})),
+            step("fs.chmod", serde_json::json!({"path": "f"})),
+        ];
+        for s in cases {
+            let e = p.stage(&c, &s).await.unwrap_err();
+            assert!(matches!(e, PartError::VoteNo(_)), "{s:?}: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn put_from_source_and_replace_tree_publish_on_one_phase_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let p = site(d.path());
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("tree")).unwrap();
+        std::fs::write(src.join("file"), "from source").unwrap();
+        std::fs::write(src.join("tree/a"), "a").unwrap();
+        let c = ctx(TxId(4), d.path());
+        let r = p.stage(&c, &step("fs.put", serde_json::json!({"path": "copy", "source": src.join("file")}))).await.unwrap();
+        assert_eq!(r.outputs["bytes"], 11);
+        p.stage(&c, &step("fs.replace_tree", serde_json::json!({"path": "tree", "source": src.join("tree")}))).await.unwrap();
+        assert_eq!(p.commit_one_phase(&c).await.unwrap(), Outcome::Committed);
+        assert_eq!(std::fs::read_to_string(p.root().join("copy")).unwrap(), "from source");
+        assert_eq!(std::fs::read_to_string(p.root().join("tree/a")).unwrap(), "a");
+    }
+
+    #[tokio::test]
+    async fn redo_ops_from_another_participant_and_wrong_state_staging() {
+        let d = tempfile::tempdir().unwrap();
+        let p = site(d.path());
+        let staged = d.path().join("built");
+        std::fs::write(&staged, "built elsewhere").unwrap();
+        let ino = std::fs::metadata(&staged).unwrap().ino();
+        let target = p.root().join("out");
+        p.stage_redo(TxId(5), vec![RedoOp::PublishFile { staged, target: target.clone(), ino }]).unwrap();
+        let c = ctx(TxId(5), d.path());
+        assert_eq!(p.prepare(&c).await.unwrap(), Vote::Prepared);
+        // Once prepared, nothing more can be staged.
+        let e = p.stage(&c, &step("fs.delete", serde_json::json!({"path": "x"}))).await.unwrap_err();
+        assert!(e.to_string().contains("in state Prepared"), "{e}");
+        assert!(p.stage_redo(TxId(5), vec![]).is_err());
+        p.commit(TxId(5)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "built elsewhere");
+    }
+
+    #[tokio::test]
+    async fn a_publish_that_cannot_happen_is_retried_not_dropped() {
+        let d = tempfile::tempdir().unwrap();
+        let p = site(d.path());
+        let c = ctx(TxId(6), d.path());
+        p.stage(&c, &step("fs.put", serde_json::json!({"path": "f", "content": "x"}))).await.unwrap();
+        assert_eq!(p.prepare(&c).await.unwrap(), Vote::Prepared);
+        // Someone removes the staged copy: the commit cannot publish it.
+        let (_, l) = p.load(TxId(6)).unwrap().unwrap();
+        std::fs::remove_dir_all(&l.stage).unwrap();
+        let e = p.commit(TxId(6)).await.unwrap_err();
+        assert!(matches!(&e, PartError::Transient(m) if m.starts_with("publish: ")), "{e}");
+    }
+
     #[tokio::test]
     async fn read_only_vote_when_nothing_staged() {
         let d = tempfile::tempdir().unwrap();

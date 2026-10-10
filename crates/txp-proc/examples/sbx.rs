@@ -1,4 +1,5 @@
-//! Debug helper: `sudo sbx <root> [--no-landlock] [--no-seccomp] -- cmd args...`
+//! Debug helper: `sudo TXP_SANDBOX_HELPER=target/debug/txp-sandbox sbx <root>
+//! [--no-landlock] [--no-seccomp] -- cmd args...`
 use std::path::PathBuf;
 use std::time::Duration;
 use txp_proc::cgroup::Cgroup;

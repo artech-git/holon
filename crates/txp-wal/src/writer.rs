@@ -106,16 +106,8 @@ impl Wal {
             table: table.clone(),
             stats: stats.clone(),
             segments: recovered.segments.iter().map(|(id, _)| *id).collect(),
-            segment_base: recovered.segments.iter().map(|(id, _)| (*id, Lsn::ZERO)).collect(),
+            segment_base: recovered.segment_bases.clone(),
         };
-        // Learn base lsns for truncation decisions.
-        for (id, path) in &recovered.segments {
-            let bytes = disk.read_all(path)?;
-            if let Some(h) = SegmentHeader::decode(&bytes)
-                && let Some(e) = w.segment_base.iter_mut().find(|(i, _)| i == id) {
-                    e.1 = h.base_lsn;
-                }
-        }
         match recovered.tail {
             Some((id, off)) => {
                 w.cur = Some(disk.open(&segment_path(dir, id))?);
@@ -261,12 +253,15 @@ impl Writer {
         Ok(())
     }
 
+    /// The open segment; present from the end of [`Wal::open`] on.
+    fn cur(&mut self) -> &mut Box<dyn SegmentHandle> {
+        self.cur.as_mut().expect("current segment")
+    }
+
     fn run(mut self, rx: mpsc::Receiver<Req>) {
-        loop {
-            let first = match rx.recv() {
-                Ok(r) => r,
-                Err(_) => return,
-            };
+        // Every handle sends `Shutdown` before letting go, so the channel
+        // only closes after the loop has already returned.
+        while let Ok(first) = rx.recv() {
             let mut reqs = vec![first];
             while reqs.len() < self.cfg.max_batch_records {
                 match rx.try_recv() {
@@ -313,21 +308,16 @@ impl Writer {
                     }
                 }
             }
-            if !batch.is_empty() || forced {
+            // Waiters only exist alongside the frames they wait for.
+            if !batch.is_empty() {
                 self.flush(&batch, forced, waiters);
-            } else {
-                for (w, lsn) in waiters {
-                    let _ = w.send(Ok(lsn));
-                }
             }
             for reply in checkpoints {
                 let r = self.checkpoint();
                 let _ = reply.send(r);
             }
             if shutdown {
-                if let Some(cur) = self.cur.as_mut() {
-                    let _ = cur.datasync();
-                }
+                let _ = self.cur().datasync();
                 return;
             }
         }
@@ -366,33 +356,28 @@ impl Writer {
         // Everything applied so far has been written (table apply happens
         // before write and we flush before servicing checkpoints), so the
         // snapshot lsn is the last written lsn. Force it durable first.
-        if let Some(cur) = self.cur.as_mut()
-            && let Err(e) = cur.datasync() {
-                fatal(&format!("fdatasync before checkpoint failed: {e}"));
-            }
+        if let Err(e) = self.cur().datasync() {
+            fatal(&format!("fdatasync before checkpoint failed: {e}"));
+        }
         let snap: TxnTableSnapshot = self.table.lock().snapshot();
         let bytes = serde_json::to_vec_pretty(&snap).map_err(|e| WalError::Io(e.to_string()))?;
         self.disk.write_atomic(&snapshot_path(&self.dir), &bytes).map_err(|e| WalError::Io(e.to_string()))?;
         let cutoff = snap.lsn.next();
-        // A segment is deletable if the *next* segment's base lsn <= cutoff
-        // and it is not the current segment.
-        let bases = self.segment_base.clone();
+        // A segment is deletable if it is not the current one and the *next*
+        // segment's base lsn is <= cutoff (so all its records are in the
+        // snapshot). Stop at the first one that is not.
+        let deletable: Vec<u64> = self
+            .segment_base
+            .windows(2)
+            .take_while(|w| w[0].0 != self.cur_id && w[1].1 <= cutoff)
+            .map(|w| w[0].0)
+            .collect();
         let mut removed = Vec::new();
-        for i in 0..bases.len() {
-            let (id, _) = bases[i];
-            if id == self.cur_id {
-                break;
-            }
-            let next_base = bases.get(i + 1).map(|(_, b)| *b).unwrap_or(Lsn::ZERO);
-            if next_base.0 > 0 && next_base <= cutoff {
-                let p = segment_path(&self.dir, id);
-                if let Err(e) = self.disk.remove(&p) {
-                    tracing::warn!(path = %p.display(), %e, "could not remove old segment");
-                } else {
-                    removed.push(id);
-                }
-            } else {
-                break;
+        for id in deletable {
+            let p = segment_path(&self.dir, id);
+            match self.disk.remove(&p) {
+                Ok(()) => removed.push(id),
+                Err(e) => tracing::warn!(path = %p.display(), %e, "could not remove old segment"),
             }
         }
         if !removed.is_empty() {

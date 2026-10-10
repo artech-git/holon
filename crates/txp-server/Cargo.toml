@@ -21,3 +21,10 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+nix = { workspace = true, features = ["user"] }
+
+[lints]
+workspace = true

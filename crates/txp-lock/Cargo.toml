@@ -10,3 +10,6 @@ txp-core = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+
+[lints]
+workspace = true

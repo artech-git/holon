@@ -115,7 +115,7 @@ cwd = "/srv/site"
 mounts = [{ resource = "site" }]`;
 
 export const testBins = `cargo test --workspace          <span class="cm"># unit, property, WAL crash-sim, engine, crash-point harness</span>
-./scripts/test-proc.sh          <span class="cm"># sandbox tests (builds as you, runs the binary with sudo)</span>
+./scripts/test-root.sh          <span class="cm"># root-only suites (builds as you, runs with sudo)</span>
 ./scripts/tlc.sh                <span class="cm"># TLA+ model check (needs ~/tla/tla2tools.jar + a JRE)</span>
 
 <span class="cm"># crash every coordinator point with a sandboxed step present</span>

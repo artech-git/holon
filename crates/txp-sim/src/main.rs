@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 use clap::{Parser, Subcommand};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Command;
 use txp_core::TxPhase;
@@ -63,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
                         cmd.env("TXP_CRASH_AT", point);
                     }
                     let out = cmd.output()?;
-                    let crashed = out.status.code() == Some(137);
+                    let crashed = out.status.signal() == Some(9);
                     let child_out = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     // Recover.
                     let (engine, report) = Engine::open(EngineConfig::new(&sc.data_dir)).await?;

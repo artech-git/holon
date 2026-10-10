@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Sandboxed OS-process participant: namespaces, overlayfs staging, cgroup v2 kill, Landlock, upperdir diff → redo publish."
 
+[[bin]]
+name = "txp-sandbox"
+path = "src/bin/txp-sandbox.rs"
+
 [dependencies]
 txp-core = { workspace = true }
 txp-participant = { workspace = true }
@@ -12,10 +16,16 @@ txp-fs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "mount", "process", "sched", "signal", "user"] }
+landlock = { workspace = true }
+seccompiler = { workspace = true }
+xattr = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

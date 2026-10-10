@@ -230,6 +230,63 @@ mod tests {
         assert_eq!(lm.held().len(), 1);
     }
 
+    #[test]
+    fn keys_drop_trailing_slashes_but_root_stays_root() {
+        assert_eq!(ResourceKey::new("fs:/srv/site///"), ResourceKey::new("fs:/srv/site"));
+        assert_eq!(ResourceKey::new("/").0, "/");
+        assert!(ResourceKey::new("/").related(&ResourceKey::new("/anything")));
+    }
+
+    #[tokio::test]
+    async fn reacquiring_is_idempotent_and_shared_upgrades_to_exclusive() {
+        let lm = LockManager::new();
+        let k = ResourceKey::new("r");
+        lm.acquire(TxId(1), k.clone(), Mode::Shared).await;
+        lm.acquire(TxId(1), k.clone(), Mode::Shared).await;
+        assert_eq!(lm.held().len(), 1);
+        lm.acquire(TxId(1), k.clone(), Mode::Exclusive).await;
+        let held = lm.held();
+        assert_eq!((held.len(), held[0].mode), (1, Mode::Exclusive));
+        // An exclusive hold already covers a shared request.
+        lm.acquire(TxId(1), k.clone(), Mode::Shared).await;
+        assert_eq!(lm.held()[0].mode, Mode::Exclusive);
+    }
+
+    #[tokio::test]
+    async fn upgrade_waits_for_other_readers() {
+        let lm = LockManager::new();
+        let k = ResourceKey::new("r");
+        lm.acquire(TxId(1), k.clone(), Mode::Shared).await;
+        lm.acquire(TxId(2), k.clone(), Mode::Shared).await;
+        let (lm2, k2) = (lm.clone(), k.clone());
+        let up = tokio::spawn(async move { lm2.acquire(TxId(1), k2, Mode::Exclusive).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!up.is_finished());
+        lm.release_all(TxId(2));
+        tokio::time::timeout(Duration::from_secs(1), up).await.unwrap().unwrap();
+        assert_eq!(lm.held().iter().map(|h| (h.txid, h.mode)).collect::<Vec<_>>(), vec![(TxId(1), Mode::Exclusive)]);
+    }
+
+    #[tokio::test]
+    async fn wait_for_graph_lists_only_conflicting_holders() {
+        let lm = LockManager::new();
+        let k = ResourceKey::new("fs:/a");
+        lm.acquire(TxId(1), k.clone(), Mode::Shared).await;
+        lm.acquire(TxId(2), k.clone(), Mode::Shared).await;
+        lm.acquire(TxId(3), ResourceKey::new("fs:/b"), Mode::Exclusive).await;
+        lm.acquire(TxId(4), ResourceKey::new("fs:/c"), Mode::Shared).await;
+        let (lm2, k2) = (lm.clone(), k.clone());
+        let w = tokio::spawn(async move { lm2.acquire(TxId(4), k2, Mode::Exclusive).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut edges: Vec<(TxId, TxId)> = lm.wait_for_graph().iter().map(|e| (e.waiter, e.holder)).collect();
+        edges.sort();
+        assert_eq!(edges, vec![(TxId(4), TxId(1)), (TxId(4), TxId(2))]);
+        // A waiter whose transaction gives up is dropped from the queue.
+        lm.release_all(TxId(4));
+        tokio::time::timeout(Duration::from_secs(1), w).await.unwrap().unwrap();
+        assert!(lm.wait_for_graph().is_empty());
+    }
+
     #[tokio::test]
     async fn no_deadlock_with_canonical_order() {
         let lm = LockManager::new();

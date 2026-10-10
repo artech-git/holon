@@ -91,3 +91,46 @@ impl Scenario {
         v
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_tells_all_from_none_from_partial() {
+        let d = tempfile::tempdir().unwrap();
+        let sc = Scenario::new(d.path(), 2);
+        assert_eq!(sc.check(false), Some(false));
+        for r in &sc.roots {
+            std::fs::write(r.join("out.txt"), "after").unwrap();
+            std::fs::remove_dir_all(r.join("tree")).unwrap();
+            std::fs::create_dir(r.join("tree")).unwrap();
+            std::fs::write(r.join("tree/new"), "new").unwrap();
+        }
+        assert_eq!(sc.check(false), Some(true));
+        // With a process step, its output must be there too.
+        assert_eq!(sc.check(true), None);
+        std::fs::write(sc.roots[0].join("made.txt"), "made").unwrap();
+        assert_eq!(sc.check(true), Some(true));
+    }
+
+    #[test]
+    fn manifest_adds_a_process_step_on_request() {
+        let d = tempfile::tempdir().unwrap();
+        let sc = Scenario::new(d.path(), 1);
+        assert!(!sc.manifest(false).contains("kind = \"process\""));
+        let m = sc.manifest(true);
+        assert!(m.contains("kind = \"process\"") && m.contains(&format!("cwd = \"{}\"", sc.roots[0].display())), "{m}");
+    }
+
+    #[test]
+    fn leftovers_lists_per_transaction_stage_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let sc = Scenario::new(d.path(), 1);
+        assert!(sc.leftovers().is_empty());
+        let stage = d.path().join(".txp-stage");
+        std::fs::create_dir_all(stage.join("root0/abc")).unwrap();
+        std::fs::write(stage.join("not-a-dir"), "").unwrap();
+        assert_eq!(sc.leftovers(), vec![stage.join("root0/abc")]);
+    }
+}

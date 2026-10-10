@@ -36,7 +36,8 @@ crates/txp-wal         segmented WAL, CRC32C framing, group-commit writer thread
 crates/txp-lock        strict 2PL over hierarchical keys, conservative ordering, wait-for graph
 crates/txp-participant Participant trait, Capabilities, PartError, local journal, registry
 crates/txp-fs          fs participant: staging, RedoOp publish (rename / RENAME_EXCHANGE, inode-based idempotency)
-crates/txp-proc        proc participant: namespaces, overlayfs, cgroup v2, Landlock, upperdir → RedoOp translation
+crates/txp-proc        proc participant: namespaces, overlayfs, cgroup v2, Landlock, seccomp, upperdir → RedoOp
+                       translation; txp-sandbox helper binary
 crates/txp-manifest    TOML manifests, validation, topological step order
 crates/txp-engine      coordinator: per-txn tasks, 2PC presumed abort, 1PC, read-only, recovery, crash points
 crates/txp-server      txpd (JSON over Unix socket)
@@ -44,7 +45,7 @@ crates/txp-cli         txp
 crates/txp-sim         txp-crashtest harness + atomicity checker
 spec/                  TwoPhasePA.tla + cfg, TLC runner
 examples/              manifests
-scripts/               test-proc.sh (root tests), tlc.sh
+scripts/               test-root.sh (root-only suites), coverage.sh, tlc.sh
 ```
 
 ## Running
@@ -53,11 +54,15 @@ The sandbox requires Linux (cgroup v2, overlayfs, Landlock, seccomp), so
 everything is built and run on a Linux host or VM.
 
 ```sh
+cargo build --workspace           # txpd, txp, txp-crashtest and the txp-sandbox helper
 cargo test --workspace            # unit, property, WAL crash-sim, engine, crash-point harness
-./scripts/test-proc.sh            # sandbox tests (builds as you, runs the binary with sudo)
+./scripts/test-root.sh            # root-only suites: sandbox, ramfs (builds as you, runs with sudo)
+./scripts/coverage.sh             # line coverage, root suites included (cargo-llvm-cov)
 ./scripts/tlc.sh                  # TLA+ model check (needs ~/tla/tla2tools.jar + a JRE)
 
-# daemon (root: namespaces, overlayfs and cgroups need CAP_SYS_ADMIN)
+# daemon (root: namespaces, overlayfs and cgroups need CAP_SYS_ADMIN). Process
+# steps are confined by the txp-sandbox helper, found next to txpd or via
+# TXP_SANDBOX_HELPER; there is no unsafe code, so no in-process fork hooks.
 # Submission is authorized by peer credentials: root and the daemon owner
 # (the sudo invoker) may submit out of the box; add --allow-uid <uid> for
 # other users, or --allow-anyone to disable the check.

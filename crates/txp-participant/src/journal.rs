@@ -128,4 +128,23 @@ mod tests {
         j.remove(TxId(5)).unwrap();
         assert!(j.list().unwrap().is_empty());
     }
+
+    #[test]
+    fn stray_files_are_skipped_but_unreadable_entries_are_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let j = Journal::open(d.path().join("j")).unwrap();
+        assert_eq!(j.dir(), d.path().join("j"));
+        std::fs::write(j.dir().join("notes.txt"), "x").unwrap();
+        std::fs::write(j.dir().join("not-hex.json"), "{}").unwrap();
+        j.set(TxId(2), LocalState::Staged, &()).unwrap();
+        assert_eq!(j.list().unwrap(), vec![(TxId(2), LocalState::Staged)]);
+        assert_eq!(j.state(TxId(3)).unwrap(), None);
+        // An entry that is not a file cannot be read or removed.
+        std::fs::create_dir(j.dir().join(format!("{}.json", TxId(4)))).unwrap();
+        assert!(j.get::<()>(TxId(4)).is_err());
+        assert!(j.remove(TxId(4)).is_err());
+        // Nor can one that is not JSON.
+        std::fs::write(j.dir().join(format!("{}.json", TxId(5))), "garbage").unwrap();
+        assert!(j.state(TxId(5)).is_err());
+    }
 }

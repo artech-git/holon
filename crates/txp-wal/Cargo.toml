@@ -14,8 +14,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
-libc = { workspace = true }
+nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+nix = { workspace = true, features = ["mount", "user"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+
+[lints]
+workspace = true

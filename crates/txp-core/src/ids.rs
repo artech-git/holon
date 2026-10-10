@@ -91,3 +91,39 @@ impl fmt::Display for Lsn {
         write!(f, "{}", self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txid_display_parse_and_serde_roundtrip() {
+        let t = TxId(0xabc);
+        assert_eq!(t.to_string(), "00000000000000000000000000000abc");
+        assert_eq!(format!("{t:?}"), "TxId(00000000000000000000000000000abc)");
+        assert_eq!(TxId::parse("  abc\n"), Some(t));
+        assert_eq!(TxId::parse(&t.to_string()), Some(t));
+        assert_eq!(TxId::parse("not hex"), None);
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"00000000000000000000000000000abc\"");
+        assert_eq!(serde_json::from_str::<TxId>(&json).unwrap(), t);
+        let e = serde_json::from_str::<TxId>("\"zz\"").unwrap_err();
+        assert!(e.to_string().contains("bad txid"), "{e}");
+    }
+
+    #[test]
+    fn generated_txids_differ() {
+        assert_ne!(TxId::generate(), TxId::generate());
+    }
+
+    #[test]
+    fn participant_id_and_lsn() {
+        let p = ParticipantId::new("fs:site");
+        assert_eq!(p.as_str(), "fs:site");
+        assert_eq!(p.to_string(), "fs:site");
+        assert_eq!(serde_json::to_string(&p).unwrap(), "\"fs:site\"");
+        assert_eq!(Lsn::ZERO.next(), Lsn(1));
+        assert_eq!(Lsn(41).to_string(), "41");
+        assert_eq!(Lsn::default(), Lsn::ZERO);
+    }
+}
